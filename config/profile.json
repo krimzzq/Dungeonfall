@@ -1,0 +1,29 @@
+{
+  "options": {
+    "music": 0,
+    "effects": 45,
+    "scale": 3,
+    "shake": true,
+    "fullscreen": true
+  },
+  "best": 15,
+  "wins": 0,
+  "checkpoint": {
+    "level": 1,
+    "seed": 686347533,
+    "kills": 0,
+    "hp": 100,
+    "max_hp": 100,
+    "power": 0,
+    "active": 0,
+    "hero": "hero",
+    "slots": [
+      [
+        "pistol",
+        12,
+        null
+      ],
+      null
+    ]
+  }
+}
