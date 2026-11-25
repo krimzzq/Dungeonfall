@@ -657,3 +657,231 @@ def room_props(rng, kind, theme):
             if count == 0:
                 break
     return props
+
+def make_dungeon(seed, level):
+    """Build a reproducible connected layout with 5–8 rooms and 1–2 chests."""
+    rng = random.Random(seed ^ (level * 31337))
+    theme = region_of(level)
+    count = rng.randint(5,8)
+    side_count = 2 if count > 6 else 1
+    path = [(0,0)]
+    horizontal = rng.choice((-1,1))
+    for _ in range(count - side_count - 1):
+        x, y = path[-1]
+        choices = [(x+dx,y+dy) for dx,dy in ((horizontal,0),(0,-1),(0,1))
+                   if (x+dx,y+dy) not in path]
+        path.append(rng.choice(choices))
+    rooms = {}
+
+    def add(coord, kind):
+        rooms[coord] = Room(kind, theme, rng.randrange(10**7), room_props(rng, kind, theme))
+        return rooms[coord]
+
+    def link(a, b):
+        dx, dy = b[0]-a[0], b[1]-a[1]
+        rooms[a].links.add((dx,dy))
+        rooms[b].links.add((-dx,-dy))
+
+    last_kind = "boss" if floor_of(level) == FLOORS_PER_REGION else "exit"
+    for index, coord in enumerate(path):
+        kind = "entry" if index == 0 else last_kind if index == len(path)-1 else "combat"
+        add(coord, kind)
+        if index:
+            link(path[index-1], coord)
+
+    guns = [name for name in WEAPONS if name != "pistol"]
+    random.Random(seed ^ 70553).shuffle(guns)
+    first = rng.choice(path[1:-1])
+    rooms[first].chest = guns[(level-1) % len(guns)]
+    for index in range(side_count):
+        branches = [((x,y),(x+dx,y+dy)) for x,y in path[:-1]
+                    for dx,dy in DOORS if (x+dx,y+dy) not in rooms]
+        anchor, point = rng.choice(branches)
+        kind = "treasure" if index == 0 else "vault"
+        room = add(point, kind)
+        link(anchor, point)
+        if index == 0 and (rng.random() < 0.68 or last_kind == "boss"):
+            room.chest = rng.choice(("power","vital","ammo","heal"))
+
+    pools = (
+        ("crawler", "crawler", "sentry", "moth", "alchemist", "stalker"),
+        ("sentry", "shield", "alchemist", "crawler", "spitter", "moth", "stalker", "prism"),
+        ("wisp", "sentry", "shield", "alchemist", "spitter", "moth", "stalker", "prism", "oracle"),
+    )
+    for room in rooms.values():
+        if room.kind == "boss":
+            room.enemies.append(Boss((455, 188), theme))
+            continue
+        if room.kind not in ("combat", "vault"):
+            continue
+        qty = 4 + (floor_of(level) >= 3) + (theme == 2) + rng.randrange(2)
+        if room.kind == "vault":
+            qty += 1
+        points = [(x, y) for x in range(105, 556, 51) for y in (110, 150, 225, 265)
+                  if all(not rect.inflate(36, 36).collidepoint(x, y) for rect in room.barriers)]
+        room.enemies = build_wave(rng, points, pools[theme], level, qty)
+        if rng.random() < SECOND_WAVE_CHANCE:
+            qty = 3 + (theme > 0) + rng.randrange(2)
+            room.reinforcements = build_wave(rng, points, pools[theme], level, qty)
+    return rooms
+
+
+def build_wave(rng, points, pool, level, count):
+    enemies = []
+    ranged_kinds = ("sentry", "alchemist", "moth", "spitter", "prism", "oracle")
+    ranged_limit = (count + 1) // 2
+    ranged = 0
+    area_attacks = 0
+    specialists = {"stalker": 0, "prism": 0, "spitter": 0}
+    for pos in rng.sample(points, min(len(points), count)):
+        available = [kind for kind in pool
+                     if (kind not in ranged_kinds or ranged < ranged_limit)
+                     and (kind not in ("alchemist", "oracle") or (level > 1 and not area_attacks))
+                     and specialists.get(kind, 0) < 2]
+        kind = rng.choice(available)
+        ranged += kind in ranged_kinds
+        area_attacks += kind in ("alchemist", "oracle")
+        if kind in specialists:
+            specialists[kind] += 1
+        enemies.append(Enemy(kind, pos, level))
+    return enemies
+
+
+def monster_drop(roll):
+    """One roll per normal enemy, with mutually exclusive drop outcomes."""
+    if roll < AMMO_DROP_TICKETS:
+        return "ammo"
+    if roll < AMMO_DROP_TICKETS + HEAL_DROP_TICKETS:
+        return "heal"
+    return None
+
+
+class Boss(Enemy):
+    """Five telegraphed patterns per boss, with a faster second phase."""
+    def __init__(self, pos, theme):
+        super().__init__("sentry", pos, (theme+1)*FLOORS_PER_REGION)
+        self.kind = "boss"
+        self.theme = theme
+        self.name = BOSS_NAMES[theme]
+        self.max_hp = self.hp = CAMPAIGN_BOSS_HP[theme]
+        self.damage = (19,23,27)[theme]
+        self.radius = 24
+        self.timer = 1.75
+        self.pattern = 0
+        self.blast_radius = (38,46,48)[theme]
+        self.warning = self.explosion = None
+        self.locked = V2(1,0)
+
+    @property
+    def enraged(self):
+        return self.hp <= self.max_hp * 0.50
+
+    def windup(self, player, barriers):
+        self.locked = unit(player.pos - self.pos, (1,0))
+        if self.pattern == 2:
+            self.warning = player.pos.copy()
+        elif self.pattern == 3:
+            self.mark_ground(player)
+        elif self.pattern == 4:
+            self.mark_beams(barriers)
+
+    def mark_ground(self, player):
+        # Stagger zones so staying put or dodging along the same line is risky.
+        along = self.locked * (38 + 6 * self.theme)
+        side = along.rotate(90)
+        patterns = ((V2(), along, along * 2),
+                    (V2(), side, -side, -along),
+                    (V2(), along + side, along - side, -along))
+        offsets = patterns[self.theme]
+        if self.enraged:
+            offsets += (-along + side, -along - side)
+        for index, offset in enumerate(offsets):
+            point, _ = clip_position(player.pos + offset, 12, ())
+            self.hazards.append(Hazard(point, max(self.timer, 0.15) + 0.16 * index,
+                                       (26,31,34)[self.theme], self.damage + 5))
+
+    def mark_beams(self, barriers):
+        spreads = ((0,), (-28,28), (0,90,-90))[self.theme]
+        if self.enraged:
+            spreads += ((180,) if self.theme != 1 else (0,))
+        for index, angle in enumerate(spreads):
+            direction = self.locked.rotate(angle)
+            ray = self.pos + direction * WIDTH * 2
+            edge = ARENA.clipline(self.pos, ray)[1]
+            distance = min(((V2(edge) - self.pos).length_squared(),
+                            *(segment_hit(self.pos, ray, cover) for cover in barriers)))
+            if distance > 12 ** 2:
+                end = self.pos + direction * math.sqrt(distance)
+                self.hazards.append(Hazard(self.pos.copy(), max(self.timer, 0.15) + index * 0.12,
+                                           10 + 2 * self.theme, self.damage + 8, end))
+
+    def step(self, dt, player, barriers):
+        self.explosion = None
+        self.flash = max(0.0, self.flash - dt)
+        self.timer -= dt
+        phase = self.enraged
+        windup = (0.70 if phase else 0.80) if self.pattern >= 3 else (0.46 if phase else 0.57)
+        if not self.attacking and self.timer <= windup:
+            self.windup(player, barriers)
+        self.attacking = self.timer <= windup
+        delta = player.pos-self.pos
+        towards = unit(delta,(1,0))
+        if self.burst > 0.0:
+            self.burst = max(0.0,self.burst-dt)
+            self.pos = move(self.pos,self.dash*(286 if phase else 235)*dt,self.radius,barriers)
+        elif not self.attacking:
+            approach = 0.67 if delta.length() > 157 else -0.52
+            motion = towards*approach + towards.rotate(90)*0.66
+            self.pos = move(self.pos,motion*(88 if phase else 64)*dt,self.radius,barriers)
+        self.moving = not self.attacking or self.burst > 0
+        # Boss art stays front-facing, so the warning remains centered over the head.
+        if self.timer > 0:
+            return []
+        if self.pattern < 3:
+            shots = (self.thorns, self.furnace, self.blizzard)[self.theme](phase)
+        elif self.pattern == 3:
+            shots = self.volley(self.locked, (-58,-30,30,58) if phase else (-48,48), 201)
+        else:
+            shots = self.volley(self.locked, range(22,360,45 if phase else 72), 146)
+        pause = 0.22 if self.pattern >= 3 else 0
+        self.pattern = (self.pattern+1)%5
+        self.timer = (1.51,1.41,1.32)[self.theme] - (0.32 if phase else 0) + pause
+        self.attacking = False
+        return shots
+
+    def thorns(self, phase):
+        if self.pattern == 0:
+            self.dash = self.locked
+            self.burst = 0.35 if phase else 0.28
+            return self.volley(self.locked, range(-44,45,11 if phase else 22),192)
+        if self.pattern == 1:
+            return self.volley(self.locked, range(0,360,18 if phase else 26),157)
+        return self.detonate()
+
+    def furnace(self, phase):
+        if self.pattern == 0:
+            return self.volley(self.locked, range(-75,76,10 if phase else 15),220)
+        if self.pattern == 1:
+            angles = tuple(range(0,360,18 if phase else 24))
+            return self.volley(self.locked,angles,164) + self.volley(self.locked,angles[::2],230)
+        return self.detonate() + self.volley(self.locked,(-42,-27,27,42),199)
+
+    def blizzard(self, phase):
+        if self.pattern == 0:
+            angles = (0,9,19,90,99,109,180,189,199,270,279,289)
+            if phase:
+                angles = angles + (49,139,229,319)
+            return self.volley(self.locked,angles,234)
+        if self.pattern == 1:
+            angles = tuple(range(0,360,15 if phase else 20))
+            return self.volley(self.locked,angles,167) + self.volley(self.locked.rotate(7),angles[::2],248)
+        return self.detonate() + self.volley(self.locked,(-66,-48,-28,28,48,66),226)
+
+    def detonate(self):
+        self.explosion, self.warning = self.warning, None
+        return []
+
+    def volley(self, direction, angles, speed):
+        color = ("#f1ac71", "#fa8567", "#b8e6ed")[self.theme]
+        return [Bullet(self.pos.copy(), direction.rotate(angle)*speed, self.damage,
+                       color, True, 3) for angle in angles]
