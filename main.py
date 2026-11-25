@@ -658,6 +658,7 @@ def room_props(rng, kind, theme):
                 break
     return props
 
+
 def make_dungeon(seed, level):
     """Build a reproducible connected layout with 5–8 rooms and 1–2 chests."""
     rng = random.Random(seed ^ (level * 31337))
@@ -885,3 +886,517 @@ class Boss(Enemy):
         color = ("#f1ac71", "#fa8567", "#b8e6ed")[self.theme]
         return [Bullet(self.pos.copy(), direction.rotate(angle)*speed, self.damage,
                        color, True, 3) for angle in angles]
+
+
+class Demon(Boss):
+    """An optional three-phase fight with a repeating, ten-part attack cycle."""
+    PATTERNS = ("кольца", "разлом", "спирали", "таран", "лучи", "метеоры",
+                "ливень", "ножницы", "клетка", "раскрытие ядра")
+
+    def __init__(self, pos):
+        super().__init__(pos, 2)
+        self.kind = "demon"
+        self.name = "Демон разлома"
+        self.hp = self.max_hp = SECRET_BOSS_HP
+        self.damage = 35
+        self.radius = 32
+        self.timer = 1.85
+        self.exposed = 0.0
+        self.recovering = False
+        self.volley_index = 0
+        self.queued = []
+        self.last_resupply = 0
+
+    @property
+    def phase(self):
+        return 1 + (self.hp <= self.max_hp * .68) + (self.hp <= self.max_hp * .34)
+
+    def receive_hit(self, damage):
+        super().receive_hit(damage * (DEMON_CORE_MULTIPLIER if self.exposed > 0 else 1))
+
+    def step(self, dt, player, barriers):
+        self.flash = max(0.0,self.flash-dt)
+        self.exposed = max(0.0,self.exposed-dt)
+        self.timer -= dt
+        phase = self.phase
+        shots = self.pending_volleys(dt)
+        if self.timer <= 0:
+            if self.recovering:
+                self.recovering = False
+                self.timer = .63
+            else:
+                shots.extend(self.fire(player))
+                self.pattern = (self.pattern+1) % len(self.PATTERNS)
+                self.timer = (.70,.59,.49)[phase-1] if not self.recovering else DEMON_CORE_TIME
+                self.attacking = False
+
+        if not self.recovering and not self.attacking and self.timer <= .40:
+            self.attacking = True
+            self.locked = unit(player.pos-self.pos,(1,0))
+            self.telegraph(player, barriers)
+        if self.burst > 0:
+            self.burst = max(0.0,self.burst-dt)
+            self.pos = move(self.pos,self.dash*(455+phase*56)*dt,self.radius,barriers)
+        elif self.recovering:
+            drift = unit(CENTER-self.pos) * 48 * dt
+            self.pos = move(self.pos,drift,self.radius,barriers)
+        elif not self.attacking or self.pattern in (0,1,2,6,7):
+            towards = unit(player.pos-self.pos,(1,0))
+            turn = 1 if self.volley_index % 2 == 0 else -1
+            approach = .62 if self.pos.distance_to(player.pos) > 152 else -.52
+            motion = towards*approach + towards.rotate(83*turn)*.76
+            before = self.pos
+            speed = (151+phase*31)*(.6 if self.attacking else 1)
+            self.pos = move(self.pos,motion*speed*dt,self.radius,barriers)
+            if self.pos.distance_squared_to(before) < .18:
+                self.pos = move(self.pos,unit(CENTER-self.pos)*speed*dt,self.radius,barriers)
+        self.moving = self.burst > 0 or not self.attacking
+        return shots
+
+    def pending_volleys(self, dt):
+        ready = []
+        waiting = []
+        for delay, shots in self.queued:
+            if delay <= dt:
+                ready.extend(shots)
+            else:
+                waiting.append((delay-dt,shots))
+        self.queued = waiting
+        return ready
+
+    def demon_shots(self, point, direction, angles, speed, color="#ee795d", curve=0):
+        return [Bullet(V2(point),direction.rotate(angle)*speed,self.damage,color,True,2.8,curve=curve)
+                for angle in angles]
+
+    def telegraph(self, player, barriers):
+        phase = self.phase
+        if self.pattern in (3,4):
+            if self.pattern == 3:
+                angles = (0,)
+            else:
+                count = 4 + phase
+                angles = tuple(index * 360/count for index in range(count))
+            for index, angle in enumerate(angles):
+                direction = self.locked.rotate(angle)
+                reach = direction * (278 if self.pattern == 3 else WIDTH*2)
+                distance, _ = terrain_hit(self.pos,self.pos+reach,barriers)
+                end = self.pos + direction * min(reach.length(), math.sqrt(distance))
+                if end.distance_squared_to(self.pos) > 28**2:
+                    self.hazards.append(Hazard(self.pos.copy(),max(.10,self.timer)+index*.035,
+                                               12 if self.pattern==3 else 9,self.damage,end))
+        elif self.pattern in (5,8):
+            if self.pattern == 5:
+                angles = range(0,360,60 if phase==1 else 45)
+                positions = [player.pos] + [player.pos + self.locked.rotate(angle)*53 for angle in angles]
+            else:
+                angles = range(0,360,45)
+                positions = [player.pos + self.locked.rotate(angle)*74 for angle in angles]
+            locations = set()
+            for index, point in enumerate(positions):
+                point = clip_position(point,17,())[0]
+                if tuple(point) not in locations:
+                    locations.add(tuple(point))
+                    self.hazards.append(Hazard(point,max(.12,self.timer)+.08*index,
+                                               23 if self.pattern==5 else 17,self.damage+4))
+
+    def fire(self, player):
+        phase = self.phase
+        pattern = self.pattern
+        self.volley_index += 1
+        fire = self.demon_shots
+        pos, aim = self.pos, self.locked
+        if pattern == 0:
+            step = (14,12,10)[phase-1]
+            self.queued.append((.16,fire(pos,aim.rotate(step/2),range(0,360,step),219+18*phase,"#f4b976")))
+            return fire(pos,aim,range(0,360,step),166+13*phase)
+        if pattern == 1:
+            self.queued.append((.13,fire(pos,aim.rotate(5),range(-64,65,8),305,"#eea664")))
+            return fire(pos,aim,range(-85,86,12-phase),245+13*phase)
+        if pattern == 2:
+            offsets = range(0,360,20-phase*3)
+            return (fire(pos,aim,offsets,164+14*phase,"#ef9bc8",118)
+                    + fire(pos,aim.rotate(8),offsets,183+11*phase,"#f28070",-118))
+        if pattern == 3:
+            self.burst, self.dash = .33, aim
+            return fire(pos,aim,range(-80,81,16-phase*2),270+16*phase)
+        if pattern == 4:
+            return fire(pos,aim.rotate(13),range(0,360,17-phase*2),166+12*phase,"#ea9dc4")
+        if pattern == 5:
+            return fire(pos,aim,(-72,-53,-34,-17,0,17,34,53,72),252)
+        if pattern == 6:
+            shots = []
+            for x in range(62,590,42-phase*3):
+                point = V2(x,ARENA.top+2)
+                if abs(x-player.pos.x) > 30:
+                    shots.extend(fire(point,V2(.27,1), (0,),235+24*phase,"#ff9969"))
+                point = V2(x,ARENA.bottom-2)
+                if abs(x-player.pos.x) > 42:
+                    shots.extend(fire(point,V2(-.25,-1), (0,),204+20*phase,"#e587b0"))
+            return shots
+        if pattern == 7:
+            swings = (-70,-47,-23,23,47,70)
+            return (fire(pos,aim,swings,226+12*phase,"#eb9ad6",150+phase*15)
+                    + fire(pos,aim,swings,226+12*phase,"#f09570",-150-phase*15))
+        if pattern == 8:
+            return fire(pos,aim,range(9,360,22-2*phase),186+18*phase,"#dc6d9d")
+        self.recovering = True
+        self.exposed = DEMON_CORE_TIME
+        return fire(pos,aim,range(16,360,30-phase*3),125+12*phase,"#edaf6f")
+
+
+class Profile:
+    """A checkpoint stores the start of the current floor."""
+    def __init__(self, path):
+        self.path = path
+        defaults = json.loads((ROOT / "config/defaults.json").read_text(encoding="utf-8"))
+        self.options = dict(defaults)
+        self.best = 0
+        self.wins = 0
+        self.checkpoint = None
+        self.error = False
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            options = data.get("options")
+            if isinstance(options, dict):
+                for key in ("music", "effects"):
+                    self.options[key] = self.bounded(options.get(key), 0, 100, defaults[key])
+                self.options["scale"] = self.bounded(options.get("scale"), 1, 3, defaults["scale"])
+                for key in ("shake", "fullscreen"):
+                    if isinstance(options.get(key), bool):
+                        self.options[key] = options[key]
+            self.best = self.bounded(data.get("best"), 0, TOTAL_FLOORS, 0)
+            self.wins = self.bounded(data.get("wins"), 0, 10**9, 0)
+            save = data.get("checkpoint")
+            if self.restore(save) is not None:
+                self.checkpoint = save
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            self.error = True
+
+    @staticmethod
+    def bounded(value, low, high, default):
+        return max(low, min(high, value)) if type(value) is int else default
+
+    @staticmethod
+    def restore(save):
+        if not isinstance(save, dict):
+            return None
+        try:
+            level, seed, kills = (save[k] for k in ("level", "seed", "kills"))
+            hero = save.get("hero", "hero")
+            if not isinstance(hero, str) or hero not in HEROES:
+                return None
+            p = Player(hero)
+            p.hp, p.max_hp, p.power = (save[k] for k in ("hp", "max_hp", "power"))
+            if (any(type(n) is not int for n in (level, seed, kills, p.hp, p.max_hp, p.power))
+                    or not (1 <= level <= TOTAL_FLOORS and 0 <= seed < 10**9 and 0 <= kills <= 1000
+                            and 0 < p.hp <= p.max_hp <= 1000 and 0 <= p.power <= 100)):
+                return None
+            slots = save.get("slots")
+            active = save.get("active", 0)
+            if slots is None:
+                # Read checkpoints from the original three-weapon version.
+                inventory = save["inventory"]
+                selected = save["selected"]
+                if not isinstance(inventory, dict) or selected not in inventory:
+                    return None
+                keys = ([selected] + [key for key in inventory if key != selected])[:2]
+                slots = [[key, *inventory[key]] for key in keys]
+                slots += [None] * (2 - len(slots))
+            if not isinstance(slots, list) or len(slots) != 2 or type(active) is not int or not 0 <= active < 2:
+                return None
+            p.slots = [None, None]
+            for index, values in enumerate(slots):
+                if values is None:
+                    continue
+                key, rounds, reserve = values
+                if key not in WEAPONS or p.magazine_for(key) or type(rounds) is not int:
+                    return None
+                if not 0 <= rounds <= WEAPONS[key].magazine:
+                    return None
+                if key == "pistol" and reserve is not None:
+                    return None
+                if key != "pistol" and (type(reserve) is not int or not 0 <= reserve <= 160):
+                    return None
+                p.slots[index] = Magazine(key, rounds, reserve)
+            if p.slots[active] is None:
+                return None
+            p.active = active
+            return level, seed, kills, p
+        except (KeyError, ValueError, TypeError):
+            return None
+
+    def save(self):
+        data = {"options": self.options, "best": self.best, "wins": self.wins,
+                "checkpoint": self.checkpoint}
+        temporary = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent,
+                                             encoding="utf-8", delete=False) as handle:
+                temporary = Path(handle.name)
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+            temporary.replace(self.path)
+            self.error = False
+        except OSError:
+            self.error = True
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+class Audio:
+    def __init__(self):
+        self.ready = pg.mixer.get_init() is not None
+        self.effects = {}
+        self.track = None
+        self.music_volume = 0.45
+        if self.ready:
+            for name in ("shot", "hurt", "impact", "kill", "chest", "pickup", "explosion", "step", "slash"):
+                self.effects[name] = pg.mixer.Sound(ASSETS / "sounds" / f"{name}.ogg")
+
+    def music(self, track):
+        if self.ready and track != self.track:
+            pg.mixer.music.load(ASSETS / "music" / f"{track}.ogg")
+            pg.mixer.music.set_volume(self.music_volume)
+            pg.mixer.music.play(-1, fade_ms=360)
+            self.track = track
+
+    def apply(self, options):
+        self.music_volume = options["music"] / 100
+        if self.ready:
+            pg.mixer.music.set_volume(self.music_volume)
+            for sound in self.effects.values():
+                sound.set_volume(options["effects"] / 100)
+
+    def play(self, name):
+        if self.ready:
+            self.effects[name].play()
+
+
+@dataclass
+class Particle:
+    pos: V2
+    vel: V2
+    ttl: float
+    color: str
+    size: int
+
+    def update(self, dt):
+        self.pos += self.vel * dt
+        self.vel *= max(0, 1 - dt * 4)
+        self.ttl -= dt
+
+
+# Application -----------------------------------------------------------------
+class Game:
+    def __init__(self, profile_path=ROOT / "config/profile.json"):
+        pg.mixer.pre_init(44100, -16, 2, 512)
+        pg.init()
+        self.profile = Profile(profile_path)
+        self.audio = Audio()
+        self.audio.apply(self.profile.options)
+        self.audio.music("vaults")
+        pg.display.set_caption("Dungeonfall")
+        self.set_window()
+        self.screen = pg.Surface((WIDTH,HEIGHT))
+        self.target = self.screen
+        self.scrim = pg.Surface((WIDTH,HEIGHT), pg.SRCALPHA)
+        self.scrim.fill((19,19,30,213))
+        self.clock = pg.time.Clock()
+        self.text_cache = {}
+        self.ink_atlases = {}
+        self.glyphs = image("ui/glyphs.png")
+        chars = json.loads((ASSETS/"ui/glyphs.json").read_text(encoding="utf-8"))
+        self.glyph_indices = {char:index for index,char in enumerate(chars)}
+        self.cover = image("ui/cover.png")
+        self.chosen_hero = "hero"
+        self.frames = {kind:self.load_frames(kind) for kind in HEROES}
+        for group in range(len(LEVELS)):
+            for kind in (*Enemy.SPECS,"boss"):
+                name=f"{kind}-{group}"
+                self.frames[name]=self.load_frames(name,64 if kind=="boss" else 32)
+        self.themes = [self.load_theme(i) for i in range(len(LEVELS))]
+        self.secret_theme = {
+            "floor":self.atlas("environment/secret-floor.png",16,16,12),
+            "wall":image("environment/secret-wall.png"),
+            "cover":self.atlas("environment/secret-cover.png",64,48,2),
+        }
+        self.chests = self.atlas("sprites/chest.png",34,29,3)
+        self.flames = self.atlas("environment/lights.png",16,18,4)
+        self.lantern_light = [self.light_stamp(c,radius)
+                              for c in ((232,145,65),(173,204,201)) for radius in (25,27)]
+        self.warning_icon = image("ui/warning.png")
+        self.frames["demon"] = self.load_frames("demon",112)
+        self.items = {key: image(f"ui/{key}.png") for key in ("heal","ammo","power","vital")}
+        self.weapons_art = dict(zip(WEAPONS, self.atlas("sprites/weapons.png",28,16,len(WEAPONS))))
+        self.gun_angles = {key:{angle:pg.transform.rotate(sprite,angle)
+                                for angle in range(0,360,15)}
+                           for key,sprite in self.weapons_art.items()}
+        self.pending_weapon = None
+        self.melee_pressed = False
+        self.buttons = []
+        self.t = 0.0
+        self.running = True
+        self.state = "menu"
+        self.fx_rng = random.Random()
+        self.setup_room()
+
+    def set_window(self):
+        self.focus_grace_until = pg.time.get_ticks() + 250
+        scale = self.profile.options["scale"]
+        desktop_w, desktop_h = pg.display.get_desktop_sizes()[0]
+        if self.profile.options["fullscreen"]:
+            self.window = pg.display.set_mode((desktop_w, desktop_h), pg.FULLSCREEN)
+        else:
+            factor = min(scale, (desktop_w - 24)/WIDTH, (desktop_h - 72)/HEIGHT)
+            w, h = max(480, round(WIDTH*factor)), max(270, round(HEIGHT*factor))
+            self.window = pg.display.set_mode((w,h), pg.RESIZABLE)
+
+    def atlas(self, path, w, h, count):
+        sheet=image(path)
+        return [sheet.subsurface((i*w,0,w,h)) for i in range(count)]
+
+    def load_frames(self,kind,size=32):
+        sheet=image(f"animations/{kind}.png")
+        frames=[[sheet.subsurface((i*size,j*size,size,size))
+                 for i in range(6)] for j in range(4)]
+        return frames,[[pg.transform.flip(frame,True,False) for frame in row] for row in frames]
+
+    def load_theme(self, index):
+        return {
+            "floor":self.atlas(f"environment/floor-{index}.png",16,16,12),
+            "wall":image(f"environment/wall-{index}.png"),
+            "props":self.atlas(f"environment/props-{index}.png",40,48,5),
+            "cover":self.atlas(f"environment/cover-{index}.png",64,48,2),
+            "gate":self.atlas(f"environment/gate-{index}.png",56,43,3),
+            "side":self.atlas(f"environment/gate-side-{index}.png",26,60,3),
+        }
+
+    def setup_room(self):
+        self.player = Player(self.chosen_hero)
+        self.level = 1
+        self.seed = random.randrange(1, 10**9)
+        self.kills = 0
+        self.load_level()
+
+    def load_level(self):
+        self.secret_progress = ""
+        self.rooms = make_dungeon(self.seed, self.level)
+        self.drops_rng = random.Random(self.seed + self.level * 199)
+        self.enter_room((0, 0), (150, 188))
+
+    def enter_room(self, coord, spawn):
+        self.coord = coord
+        self.room = self.rooms[coord]
+        self.room.visited = True
+        self.barriers = self.room.barriers
+        self.enemies = self.room.enemies
+        self.player.pos.update(spawn)
+        self.player.invulnerable = max(0.8, self.player.invulnerable)
+        self.bullets = []
+        self.particles = []
+        self.blasts = []
+        self.beam_flashes = []
+        self.fields = []
+        self.arcs = []
+        self.melee_pressed = False
+        self.player.melee_flash = 0
+        self.player.reset_weapon_state()
+        self.shake = 0.0
+        self.gate_open = 0.26 if self.room.cleared else 0.0
+        self.room_arrived = self.t
+        self.step_timer = 0.0
+        self.message = ""
+        self.message_until = 0
+        self.doors = {direction: DOORS[direction] for direction in self.room.links}
+        self.make_floor(self.room.seed)
+        self.cover_layers = []
+        props = self.themes[self.room.theme]["props"]
+        cover = (self.secret_theme if self.room.kind == "secret" else self.themes[self.room.theme])["cover"]
+        for index, rect in self.room.props:
+            if index >= 5:
+                sprite = cover[index-5]
+                w, h = sprite.get_size()
+                pos = V2(rect.centerx-w/2, rect.bottom-34)
+            else:
+                w = rect.width + 15
+                h = max(rect.height + 20, 42 if self.room.theme==0 and index==2 else 33)
+                sprite = pg.transform.scale(props[index],(w,h))
+                pos = V2(rect.centerx-w/2,rect.bottom-h*0.87)
+            self.cover_layers.append((rect.bottom,sprite,pos))
+        rng=random.Random(self.room.seed ^ 105)
+        self.motes=[(rng.randrange(15),rng.randrange(46,594),rng.randrange(82,292))
+                    for _ in range(23)]
+        self.sync_music()
+
+    def sync_music(self):
+        active = self.state in ("play", "pause", "swap") or (
+            self.state == "settings" and self.settings_from == "pause")
+        if active:
+            if self.room.kind == "secret":
+                self.audio.music("demon")
+            else:
+                prefix = "boss" if self.room.kind == "boss" and not self.room.cleared else "region"
+                self.audio.music(f"{prefix}-{self.room.theme}")
+        else:
+            self.audio.music("vaults")
+
+    def check_secret_key(self, event):
+        if self.room.kind == "secret":
+            return False
+        if event.key == pg.K_KP6:
+            char = "6"
+        elif 32 < event.key < 127:
+            char = chr(event.key).lower()
+        else:
+            char = getattr(event, "unicode", "").lower().translate(str.maketrans("лщшдь","koilm"))
+        if len(char) != 1 or not char.isalnum():
+            return False
+        attempt = self.secret_progress + char
+        self.secret_progress = next((SECRET_CODE[:length] for length in range(len(SECRET_CODE),0,-1)
+                                     if attempt.endswith(SECRET_CODE[:length])), "")
+        if self.secret_progress == SECRET_CODE:
+            self.open_secret()
+            return True
+        return False
+
+    def open_secret(self):
+        props = [(5,pg.Rect(x,y,42,15)) for x,y in ((145,121),(452,121),(145,244),(452,244))]
+        room = Room("secret",1,self.seed,props)
+        room.enemies.append(Demon((467,185)))
+        self.rooms = {(0,0):room}
+        self.player.hp = self.player.max_hp
+        self.player.reload = self.player.cooldown = 0.0
+        for clip in self.player.slots:
+            if clip:
+                magazine = WEAPONS[clip.name].magazine
+                clip.rounds = magazine
+                if clip.reserve is not None:
+                    clip.reserve = max(clip.reserve, 3*magazine)
+        self.enter_room((0,0),(154,188))
+        self.audio.play("explosion")
+        self.notify("РАЗЛОМ ОТКРЫТ")
+
+    def nearby(self):
+        weapon = next((drop for drop in self.room.loot
+                       if drop.kind in WEAPONS and drop.ready(self.t) and self.player.pos.distance_to(drop.pos) < 26), None)
+        if weapon is not None:
+            return "weapon", weapon, f"E  Взять {WEAPONS[weapon.kind].name}"
+        if self.room.chest and not self.room.opened and self.player.pos.distance_to(CENTER) < 37:
+            if self.room.cleared:
+                return "chest", None, "E  Открыть сундук"
+            return "", None, "Сундук запечатан до конца боя"
+        if self.progress_gate() and self.player.pos.distance_to(CENTER) < 40:
+            title = "В следующую локацию" if self.room.kind == "boss" else "Спуститься"
+            return "stairs", None, f"E  {title}"
+        for direction, (point, _, name) in self.doors.items():
+            if self.player.pos.distance_to(point) < 32:
+                message = f"E  Ворота: {name}" if self.room.cleared else "Ворота заперты до конца боя"
+                return "door", direction, message
+        return "", None, ""
