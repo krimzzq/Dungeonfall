@@ -250,3 +250,150 @@ class Player:
             elif self.out_of_ammo():
                 # A slow emergency refill prevents a locked arena with two dry weapons.
                 self.reload = 2.3
+def shoot(self):
+        if self.cooldown > 0 or self.reload > 0:
+            return []
+        clip = self.clip
+        if clip.rounds == 0:
+            self.start_reload()
+            return []
+        key = self.selected
+        if key == "rapier" and self.charge < RAPIER_CHARGE:
+            return []
+        self.charge = 0.0
+        clip.rounds -= 1
+        self.cooldown = self.weapon.interval - (0.116 * self.spin if key == "pulse" else 0)
+        self.flash = 0.11
+        target = clip_position(self.aim_point, 10, ())[0] if key == "anvil" else None
+        return [Bullet(self.pos.copy(), self.aim.rotate(angle) * self.weapon.speed,
+                       self.weapon.damage + self.power, self.weapon.color, ttl=2.15 if key=="saw" else 1.4,
+                       piercing=self.weapon.piercing, blast=self.weapon.blast,
+                       weapon=key, destination=target)
+                for angle in self.weapon.angles]
+
+    def swing(self):
+        if self.melee_timer > 0:
+            return False
+        self.melee_timer = MELEE_INTERVAL
+        self.melee_flash = MELEE_FLASH
+        self.slash_direction = self.aim.copy()
+        return True
+
+    def hurt(self, amount):
+        if self.invulnerable or self.hp <= 0:
+            return False
+        self.hp = max(0, self.hp - amount)
+        self.invulnerable = 0.68
+        self.hurt_flash = 0.18
+        return True
+
+
+def unit(delta, default=(0, 0)):
+    return delta.normalize() if delta.length_squared() else V2(default)
+
+
+@dataclass
+class Hazard:
+    point: V2
+    wait: float
+    radius: int
+    damage: int
+    end: V2 | None = None
+
+
+class Enemy:
+    # Crawler pursues, sentry fires from range, wisp warns before each lunge.
+    SPECS = {"crawler": (37, 62, 9), "sentry": (49, 54, 10), "wisp": (34, 82, 11),
+             "shield": (69, 56, 13), "alchemist": (50, 49, 12),
+             "moth": (34, 83, 9), "spitter": (53, 48, 12),
+             "stalker": (58, 94, 14), "prism": (48, 57, 13), "oracle": (67, 46, 14)}
+
+    def __init__(self, kind, pos, level=1):
+        self.kind = kind
+        self.pos = V2(pos)
+        health, speed, damage = self.SPECS[kind]
+        self.max_hp = health + (level - 1) * 4
+        self.hp = self.max_hp
+        self.speed = speed + (level - 1) * 1.7
+        self.damage = damage + (level - 1) // 2
+        self.radius = 10
+        self.timer = 0.7 + (self.pos.x % 30) / 30
+        self.burst = 0.0
+        self.dash = V2()
+        self.flash = 0.0
+        self.attacking = False
+        self.moving = False
+        self.left = False
+        self.facing = V2(1, 0)
+        self.warning = self.explosion = None
+        self.blast_radius = 32
+        self.level = level
+        self.shot_direction = V2(1, 0)
+        self.hazards = []
+        self.orbit = -1 if self.pos.x % 2 else 1
+        self.frost_marks = self.ember_marks = 0
+        self.frost_window = self.ember_window = self.frozen = 0.0
+
+    def receive_shot(self, bullet, damage):
+        frontal = self.kind == "shield" and self.facing.dot(-unit(bullet.vel)) > 0.42
+        if frontal and not self.attacking and not bullet.blast:
+            damage = max(2, damage // 3)
+        self.receive_hit(damage)
+
+    def receive_hit(self, damage):
+        self.hp -= damage
+        self.flash = 0.18
+
+    def tick_status(self, dt):
+        self.frost_window = max(0, self.frost_window - dt)
+        self.ember_window = max(0, self.ember_window - dt)
+        self.frozen = max(0, self.frozen - dt)
+        if not self.frost_window:
+            self.frost_marks = 0
+        if not self.ember_window:
+            self.ember_marks = 0
+
+
+    def specialist(self, dt, player, delta, distance, direction, obstructed):
+        """Lock the aim during windup, then commit to the move or shot."""
+        shots = []
+        if self.kind == "stalker":
+            if self.burst > 0:
+                self.burst = max(0.0, self.burst - dt)
+                return self.dash * 3.15, shots
+            if self.attacking or (self.timer <= 0.43 and distance < 150 and not obstructed):
+                if not self.attacking:
+                    self.shot_direction = unit(delta, self.shot_direction)
+                self.attacking = self.timer > 0
+                if self.attacking:
+                    return -direction * 0.42, shots
+                self.burst, self.dash, self.timer = 0.29, self.shot_direction, 1.56
+                self.orbit *= -1
+                return self.dash * 3.15, shots
+            self.timer = max(0.18, self.timer)
+            return direction.rotate(self.orbit * (50 if distance < 175 else 22)), shots
+
+        # Ranged specialists retreat in open space and close in around cover.
+        if distance < 116 and not obstructed:
+            direction *= -0.76
+        elif distance < 205 and not obstructed:
+            direction = direction.rotate(self.orbit * 85) * 0.69
+        windup = 0.60 if self.kind == "oracle" else 0.48
+        can_attack = distance < 240 and (self.kind == "oracle" or not obstructed)
+        if not self.attacking and self.timer <= windup and can_attack:
+            self.attacking = True
+            self.shot_direction = unit(delta, self.shot_direction)
+            if self.kind == "oracle":
+                offset = self.shot_direction.rotate(90) * 33
+                for point, delay in ((player.pos, 0), (player.pos + offset, 0.24)):
+                    point, _ = clip_position(point, 16, ())
+                    self.hazards.append(Hazard(point, max(0.25, self.timer) + delay, 26, self.damage))
+        if self.attacking and self.timer <= 0:
+            self.attacking = False
+            self.timer = 2.38 if self.kind == "oracle" else 1.76
+            if self.kind == "prism":
+                for angle, curve in ((-33, 92), (0, 0), (33, -92)):
+                    shots.append(Bullet(self.pos.copy(), self.shot_direction.rotate(angle) * 202,
+                                        self.damage, "#c0a5f0", True, 3, curve=curve))
+            self.orbit *= -1
+        return direction, shots
