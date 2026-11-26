@@ -1400,3 +1400,218 @@ class Game:
                 message = f"E  Ворота: {name}" if self.room.cleared else "Ворота заперты до конца боя"
                 return "door", direction, message
         return "", None, ""
+
+        def progress_gate(self):
+        return self.room.kind == "exit" or (
+            self.room.kind == "boss" and self.room.cleared and self.level < TOTAL_FLOORS)
+
+    def chest_drop_position(self):
+        approach = unit(self.player.pos - CENTER, (0,1))
+        angles = (90, -90, 45, -45, 135, -135, 180, 0)
+        for radius in (38, 46):
+            for angle in angles:
+                point = CENTER + approach.rotate(angle) * radius
+                body = target_rect(point, 9)
+                if ARENA.contains(body) and not any(body.colliderect(rect) for rect in self.barriers):
+                    return point
+        # The center has at most a few separated props, but retain a safe fallback.
+        for y in range(105, 270, 16):
+            for x in range(92, 570, 16):
+                point = V2(x,y)
+                if point.distance_to(CENTER) >= 29 and target_rect(point,9).collidelist(self.barriers) == -1:
+                    return point
+        raise RuntimeError("Room has no free position for chest loot")
+
+    def interact(self):
+        action, target, _ = self.nearby()
+        if action == "weapon":
+            drop = target
+            clip = self.player.magazine_for(drop.kind)
+            if clip is not None:
+                if clip.reserve is not None:
+                    clip.reserve = min(160, clip.reserve + 23)
+                self.room.loot.remove(drop)
+                self.notify("Патроны пополнены")
+                self.audio.play("pickup")
+            else:
+                self.pending_weapon = drop
+                self.change_state("swap")
+        elif action == "chest":
+            self.audio.play("chest")
+            self.burst(CENTER, GOLD, 20, 80)
+            landing = self.chest_drop_position()
+            self.room.opened = True
+            self.room.opened_at = self.t
+            self.room.loot.append(Drop(self.room.chest, landing, origin=CENTER.copy(), born=self.t))
+        elif action == "stairs":
+            next_region = self.room.kind == "boss"
+            self.level += 1
+            self.player.hp = self.player.max_hp if next_region else min(self.player.max_hp, self.player.hp + FLOOR_RECOVERY)
+            if next_region:
+                self.player.power += 2
+            self.load_level()
+            self.checkpoint()
+            self.audio.play("chest")
+        elif action == "door" and self.room.cleared:
+            dx, dy = target
+            self.enter_room((self.coord[0] + dx, self.coord[1] + dy), self.doors[target][1])
+
+    def equip_pending(self, index):
+        drop = self.pending_weapon
+        old = self.player.slots[index]
+        if old:
+            self.room.loot.append(Drop(old.name, drop.pos.copy(), old))
+        magazine = WEAPONS[drop.kind].magazine
+        reserve = None if drop.kind == "pistol" else max(32, magazine * 3)
+        self.player.slots[index] = drop.clip or Magazine(drop.kind, magazine, reserve)
+        self.player.active = index
+        self.player.reload = 0
+        self.player.reset_weapon_state()
+        self.room.loot.remove(drop)
+        self.pending_weapon = None
+        self.change_state("play")
+        self.notify(f"{WEAPONS[drop.kind].name} в слоте {index+1}")
+        self.audio.play("pickup")
+        self.burst(drop.pos, CYAN, 12, 55)
+
+    def collect(self):
+        for drop in self.room.loot[:]:
+            if drop.kind in WEAPONS or not drop.ready(self.t) or self.player.pos.distance_to(drop.pos) >= 17:
+                continue
+            p = self.player
+            if drop.kind == "heal":
+                if p.hp == p.max_hp:
+                    continue
+                p.hp = min(p.max_hp, p.hp + 30)
+            elif drop.kind == "ammo":
+                magazines = [c for c in p.slots if c and c.reserve is not None and c.reserve < 160]
+                if not magazines:
+                    continue
+                for clip in magazines:
+                    clip.reserve = min(160, clip.reserve + 22)
+            elif drop.kind == "vital":
+                p.max_hp += 15
+                p.hp += 15
+            elif drop.kind == "power":
+                p.power += 2
+            self.room.loot.remove(drop)
+            self.notify(LOOT[drop.kind])
+            self.audio.play("pickup")
+            self.burst(drop.pos, CYAN, 9, 45)
+
+    def notify(self, message):
+        self.message, self.message_until = message, self.t + 2.0
+
+
+    def rect(self, color, bounds, width=0):
+        pg.draw.rect(self.target, color, pg.Rect(bounds), width)
+
+    def line(self, color, start, end, width=1):
+        pg.draw.line(self.target, color, start, end, width)
+
+    def put_sprite(self, sprite, pos, size=None):
+        if size is not None:
+            sprite = pg.transform.scale(sprite, size)
+        self.target.blit(sprite, pos)
+
+    def make_floor(self, seed):
+        rng = random.Random(seed)
+        theme = self.room.theme
+        secret = self.room.kind == "secret"
+        assets = self.secret_theme if secret else self.themes[theme]
+        floor = assets["floor"]
+        wall = assets["wall"]
+        self.backdrop = pg.Surface((WIDTH,HEIGHT))
+        self.backdrop.fill(("#222630","#241e2b","#182635")[theme])
+        self.target = self.backdrop
+
+        for y in range(53,326,16):
+            for x in range(24,609,16):
+                dx, dy = x + 8 - 320, y + 8 - 188
+                near_x, near_y = abs(dx) <= 27, abs(dy) <= 26
+                doorway_x = (-1 if dx<0 else 1,0) in self.doors
+                doorway_y = (0,-1 if dy<0 else 1) in self.doors
+                path = (near_y and doorway_x) or (near_x and doorway_y) or (near_x and near_y)
+                if theme==2:
+                    path = path or rng.random()<0.15
+                if self.room.kind in ("boss","secret"):
+                    path = 82 < x < 556 and 89 < y < 288
+                regular = rng.choices((0,1,2,3,4,5),(7,3,2,3,1,2))[0]
+                variant = rng.randint(6,11) if path else regular
+                self.put_sprite(floor[variant], (x,y))
+
+        for edge_y,direction in ((48,(0,-1)),(308,(0,1))):
+            for x in range(24,615,16):
+                if direction not in self.doors or not (294 < x < 345):
+                    self.put_sprite(wall,(x,edge_y))
+        for edge_x,direction in ((17,(-1,0)),(598,(1,0))):
+            for y in range(72,308,16):
+                if direction not in self.doors or not (157<y<214):
+                    self.put_sprite(wall,(edge_x,y),(22,18))
+
+        if secret:
+            for x,y in ((320,116),(242,151),(398,151),(242,219),(398,219),(320,265)):
+                self.rect("#302534",(x-15,y-8,30,16))
+                self.line("#925267",(x-13,y),(x,y-6),2)
+                self.line("#925267",(x,y-6),(x+13,y),2)
+                self.line("#744256",(x+13,y),(x,y+6),2)
+                self.line("#744256",(x,y+6),(x-13,y),2)
+                self.rect("#cd7c63",(x-2,y-2,4,4))
+        elif theme == 0:
+            tree=assets["props"][2]
+            # Layer trees in the upper border without adding invisible collision.
+            tree_centers = (47,72,102,151,177,231,254,284,
+                            354,380,428,471,498,553,586)
+            for x in tree_centers:
+                if (0,-1) in self.doors and 277<x<367:
+                    continue
+                dy = rng.randint(-7,3)
+                mini = rng.choice(((30,35),(34,40),(39,43)))
+                self.put_sprite(tree,(x-17,34+dy),mini)
+            for x,y in ((36,82),(570,80),(38,260),(567,265)):
+                self.put_sprite(tree,(x,y), (30,36))
+            for _ in range(14):
+                x,y=rng.randrange(47,593),rng.randrange(83,290)
+                if abs(x-320)>55 and abs(y-188)>36:
+                    pg.draw.lines(self.target,"#4c6c55",False,((x-5,y+2),(x-2,y+1),(x+3,y+1)),2)
+                    self.rect("#55745a",(x-2,y-3,2,4))
+                    if rng.random()<0.26:
+                        self.rect("#a69e75",(x-2,y-3,2,2))
+        elif theme == 1:
+            for x in (113,211,416,511):
+                for y in (124,251):
+                    self.rect("#4a353d",(x-13,y-7,26,14))
+                    self.rect("#9e7158",(x-11,y-6,22,1))
+                    self.rect("#6e5352",(x-10,y+3,20,2))
+                    for i in range(-1,2):
+                        self.rect("#b18766",(x+6*i-1,y-2,3,3))
+            for x in (88,151,231,400,480,539):
+                self.rect("#332733",(x,50,12,19))
+                self.rect("#bb7954",(x+2,51,8,2))
+                self.rect("#8f4d43",(x+3,54,6,10))
+                self.rect("#e0a26a",(x+4,55,4,2))
+                self.rect("#9c6551",(x+2,65,8,2))
+            for x in (77,196,306,433,548):
+                for y in (91,282):
+                    self.rect("#3d3038",(x,y,13,5))
+                    self.rect("#856757",(x+2,y+1,9,2))
+        else:
+            for x in (90,155,227,403,480,540):
+                for y in (70,310):
+                    self.rect("#547887",(x,y,15,3))
+                    self.rect("#a0c5c6",(x+1,y,12,2))
+                    self.rect("#7198a4",(x+6,y+3,4,5))
+            for _ in range(10):
+                x,y=rng.randrange(50,587),rng.randrange(84,290)
+                if abs(x-320)>78 or abs(y-188)>30:
+                    self.line("#2e5566",(x,y),(x+9,y-4))
+                    self.line("#76a0ac",(x+1,y),(x+9,y-3))
+
+        if self.room.kind in ("exit","boss"):
+            for x,y in ((320,113),(254,166),(386,166),(254,217),(386,217),(320,265)):
+                self.rect("#262933",(x-8,y-4,16,9))
+                self.rect(THEME_COLORS[theme],(x-6,y-3,12,1))
+                self.line(THEME_COLORS[theme],(x-3,y+1),(x,y+3))
+                self.line(THEME_COLORS[theme],(x,y+3),(x+3,y+1))
+
+        self.target = self.screen
