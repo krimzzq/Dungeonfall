@@ -1401,11 +1401,12 @@ class Game:
                 return "door", direction, message
         return "", None, ""
 
-        def progress_gate(self):
+    def progress_gate(self):
         return self.room.kind == "exit" or (
             self.room.kind == "boss" and self.room.cleared and self.level < TOTAL_FLOORS)
 
     def chest_drop_position(self):
+        # Favor the side facing the visitor. Leave room for both their body and the item.
         approach = unit(self.player.pos - CENTER, (0,1))
         angles = (90, -90, 45, -45, 135, -135, 180, 0)
         for radius in (38, 46):
@@ -1533,6 +1534,7 @@ class Game:
                 doorway_y = (0,-1 if dy<0 else 1) in self.doors
                 path = (near_y and doorway_x) or (near_x and doorway_y) or (near_x and near_y)
                 if theme==2:
+                    # Keep glassy blue seams visible between the paler, snow-covered tiles.
                     path = path or rng.random()<0.15
                 if self.room.kind in ("boss","secret"):
                     path = 82 < x < 556 and 89 < y < 288
@@ -1608,6 +1610,7 @@ class Game:
                     self.line("#76a0ac",(x+1,y),(x+9,y-3))
 
         if self.room.kind in ("exit","boss"):
+            # Inlaid marks identify the destination without a directional arrow.
             for x,y in ((320,113),(254,166),(386,166),(254,217),(386,217),(320,265)):
                 self.rect("#262933",(x-8,y-4,16,9))
                 self.rect(THEME_COLORS[theme],(x-6,y-3,12,1))
@@ -1615,3 +1618,448 @@ class Game:
                 self.line(THEME_COLORS[theme],(x,y+3),(x+3,y+1))
 
         self.target = self.screen
+
+    def text_bitmap(self, words, size, color):
+        words = words.upper()
+        key=(words,size,color)
+        if key in self.text_cache:
+            return self.text_cache[key]
+        if color not in self.ink_atlases:
+            atlas = self.glyphs.copy()
+            atlas.fill(pg.Color(color), special_flags=pg.BLEND_RGBA_MULT)
+            self.ink_atlases[color]=atlas
+        atlas=self.ink_atlases[color]
+        surface = pg.Surface((max(1,len(words)*6-1),7), pg.SRCALPHA)
+        for index,char in enumerate(words):
+            glyph = self.glyph_indices.get(char,self.glyph_indices["?"])
+            surface.blit(atlas,(index*6,0),(glyph*6,0,5,7))
+        if size!=1:
+            surface=pg.transform.scale_by(surface,size)
+        if len(self.text_cache)>=420:
+            self.text_cache.clear()
+        self.text_cache[key]=surface
+        return surface
+
+    def label(self, words, x, y, size=1, color=PAPER, align="left"):
+        glyphs=self.text_bitmap(words,size,color)
+        if align=="center":
+            x-=glyphs.get_width()//2
+        elif align=="right":
+            x-=glyphs.get_width()
+        self.target.blit(glyphs,(round(x),round(y)))
+
+    def panel(self,bounds,fill="#272631",edge="#69545a"):
+        x,y,w,h=bounds
+        self.rect("#171821",(x-2,y-2,w+4,h+4))
+        self.rect(edge,(x,y,w,h))
+        self.rect(fill,(x+1,y+1,w-2,h-2))
+        self.rect(edge,(x+2,y+2,2,2))
+        self.rect(edge,(x+w-4,y+2,2,2))
+        self.rect(edge,(x+w-4,y+h-4,2,2))
+        self.rect(edge,(x+2,y+h-4,2,2))
+
+    def button(self, words, x, y, action, width=198):
+        rect=pg.Rect(x,y,width,26)
+        self.buttons.append((rect,action))
+        hover=rect.collidepoint(self.mouse())
+        self.panel(rect, "#483e45" if hover else "#302c37",
+                   GOLD if hover else "#7e6561")
+        size=2 if len(words)<=max((width-15)//12,1) else 1
+        self.label(words,x+width//2,y+(26-7*size)//2,size,PAPER,"center")
+
+    def viewport(self):
+        w, h = self.window.get_size()
+        factor = min(w / WIDTH, h / HEIGHT)
+        sw, sh = max(1, int(WIDTH * factor)), max(1, int(HEIGHT * factor))
+        return pg.Rect((w - sw) // 2, (h - sh) // 2, sw, sh)
+
+    def mouse(self, position=None):
+        rect = self.viewport()
+        x, y = pg.mouse.get_pos() if position is None else position
+        return V2((x - rect.x) * WIDTH / rect.w, (y - rect.y) * HEIGHT / rect.h)
+
+    def show_controls(self):
+        self.change_state("controls")
+
+    def choose_hero(self, hero):
+        self.chosen_hero = hero
+
+    def start(self):
+        self.setup_room()
+        self.checkpoint()
+        self.change_state("play")
+
+    def checkpoint(self):
+        p = self.player
+        self.profile.checkpoint = {
+            "level": self.level, "seed": self.seed, "kills": self.kills,
+            "hp": p.hp, "max_hp": p.max_hp, "power": p.power, "active": p.active, "hero": p.hero,
+            "slots": [[c.name, c.rounds, c.reserve] if c else None for c in p.slots],
+        }
+        self.profile.best = max(self.profile.best, self.level)
+        self.profile.save()
+
+    def continue_run(self):
+        restored = Profile.restore(self.profile.checkpoint)
+        if restored is not None:
+            self.level, self.seed, self.kills, self.player = restored
+            self.chosen_hero = self.player.hero
+            self.load_level()
+            self.change_state("play")
+
+    def finish_run(self, won):
+        self.change_state("win" if won else "dead")
+        if won or self.room.kind != "secret":
+            self.profile.checkpoint = None
+        self.profile.wins += int(won)
+        self.profile.save()
+        if won:
+            self.audio.play("chest")
+
+    def change_state(self, state):
+        self.buttons.clear()
+        self.state = state
+        self.melee_pressed = False
+        pg.mouse.set_visible(state != "play")
+        self.sync_music()
+
+    def settings(self):
+        self.settings_from = self.state
+        self.change_state("settings")
+
+    def option(self, key, direction=1):
+        options = self.profile.options
+        if key in ("music", "effects"):
+            options[key] = min(100, max(0, options[key] + direction * 10))
+        elif key == "scale":
+            options[key] = (options[key] - 1 + direction) % 3 + 1
+            options["fullscreen"] = False
+            self.set_window()
+        elif key == "fullscreen":
+            options[key] = not options[key]
+            self.set_window()
+        else:
+            options[key] = not options[key]
+        self.audio.apply(options)
+        self.profile.save()
+
+    def quit(self):
+        self.running = False
+
+    def escape(self):
+        if self.state == "play":
+            self.change_state("pause")
+        elif self.state == "pause":
+            self.change_state("play")
+        elif self.state == "settings":
+            self.change_state(self.settings_from)
+        elif self.state == "swap":
+            self.pending_weapon = None
+            self.change_state("play")
+        elif self.state in ("dead", "win", "controls"):
+            self.change_state("menu")
+        else:
+            self.quit()
+
+    def events(self):
+        for event in pg.event.get():
+            if event.type == pg.QUIT:
+                self.quit()
+                return
+            if (event.type == pg.WINDOWFOCUSLOST and self.state == "play"
+                    and pg.time.get_ticks() >= self.focus_grace_until):
+                self.change_state("pause")
+            if event.type == pg.KEYDOWN:
+                if event.key == pg.K_F11:
+                    playing = self.state == "play"
+                    self.option("fullscreen")
+                    if playing:
+                        self.change_state("play")
+                elif event.key == pg.K_ESCAPE:
+                    self.escape()
+                elif self.state == "controls":
+                    if event.key in (pg.K_RETURN, pg.K_KP_ENTER):
+                        self.start()
+                    elif event.key in (pg.K_1, pg.K_2):
+                        self.choose_hero(tuple(HEROES)[event.key-pg.K_1])
+                elif self.state == "swap" and event.key in (pg.K_1, pg.K_2):
+                    self.equip_pending(event.key - pg.K_1)
+                elif self.state == "play" and self.player.hp > 0:
+                    if self.check_secret_key(event):
+                        continue
+                    if event.key == pg.K_e:
+                        self.interact()
+                    elif event.key == pg.K_r:
+                        self.player.start_reload()
+                    elif event.key in (pg.K_1, pg.K_2):
+                        self.player.select(event.key - pg.K_1)
+            if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
+                for rect, action in self.buttons[:]:
+                    if rect.collidepoint(self.mouse(event.pos)):
+                        action()
+                        break
+            elif event.type == pg.MOUSEBUTTONDOWN and event.button == 3 and self.state == "play":
+                self.melee_pressed = True
+
+
+    def update(self, dt):
+        if self.state == "play":
+            keys = pg.key.get_pressed()
+            direction = V2((keys[pg.K_d] or keys[pg.K_RIGHT]) - (keys[pg.K_a] or keys[pg.K_LEFT]),
+                           (keys[pg.K_s] or keys[pg.K_DOWN]) - (keys[pg.K_w] or keys[pg.K_UP]))
+            buttons = pg.mouse.get_pressed()
+            melee = self.melee_pressed or buttons[2]
+            self.melee_pressed = False
+            self.update_play(dt, direction, self.mouse(), buttons[0], melee)
+
+    def update_play(self, dt, direction, aim, firing, melee=False):
+        if self.state != "play":
+            return
+        player = self.player
+        before = player.pos
+        player.steer(direction, dt, self.barriers)
+        self.step_timer -= dt
+        if player.pos.distance_squared_to(before) > 0.25 and self.step_timer <= 0:
+            self.audio.play("step")
+            self.step_timer = 0.29
+            self.burst(player.pos+(0,4), "#77716a", 3, 25)
+        self.shake = max(0.0, self.shake - dt)
+        for particle in self.particles:
+            particle.update(dt)
+        self.particles[:] = [p for p in self.particles if p.ttl > 0]
+        self.blasts[:] = [(pos, ttl-dt, r) for pos, ttl, r in self.blasts if ttl > dt]
+        self.beam_flashes[:] = [(hazard, ttl-dt) for hazard, ttl in self.beam_flashes if ttl > dt]
+        self.arcs[:] = [(start, end, color, ttl-dt) for start,end,color,ttl in self.arcs if ttl > dt]
+        player.tick(dt, aim, firing)
+        if melee and player.swing():
+            self.melee_attack()
+        if firing:
+            shots = player.shoot()
+            if shots:
+                self.bullets.extend(shots)
+                self.on_shot(shots)
+        for enemy in self.enemies:
+            if enemy.hp <= 0:
+                continue
+            enemy.tick_status(dt)
+            slowed = 0.80 if isinstance(enemy,Boss) else 0.24
+            self.bullets.extend(enemy.step(dt*slowed if enemy.frozen else dt, player, self.barriers))
+            if (isinstance(enemy,Demon) and enemy.recovering and enemy.volley_index % 30 == 0
+                    and enemy.last_resupply != enemy.volley_index):
+                enemy.last_resupply = enemy.volley_index
+                for point in (V2(94,180),V2(551,208)):
+                    if not any(drop.pos == point for drop in self.room.loot):
+                        self.room.loot.append(Drop("ammo",point))
+            self.update_hazards(enemy, dt)
+            if enemy.explosion is not None:
+                self.on_explosion(enemy.explosion, enemy.blast_radius)
+                if enemy.explosion.distance_to(player.pos) < enemy.blast_radius:
+                    self.hit_player(enemy.damage + 4)
+            if (enemy.burst > 0 or isinstance(enemy, Boss)) and enemy.pos.distance_to(player.pos) < enemy.radius + 7:
+                self.hit_player(enemy.damage)
+        self.space_out_enemies(dt)
+        self.update_fields(dt)
+        self.update_bullets(dt)
+        for enemy in self.enemies[:]:
+            if enemy.hp <= 0:
+                self.enemies.remove(enemy)
+                self.on_enemy_dead(enemy)
+        if self.room.kind == "secret" and self.room.cleared:
+            self.finish_run(True)
+            return
+        if player.hp <= 0:
+            self.finish_run(False)
+            return
+        self.update_waves(dt)
+        self.collect()
+        if self.room.cleared:
+            self.gate_open = min(0.26,self.gate_open + dt)
+        if self.room.kind == "boss" and self.room.cleared:
+            if self.level == TOTAL_FLOORS:
+                self.finish_run(True)
+            elif not self.room.rewarded:
+                self.room.rewarded = True
+                self.sync_music()
+                self.notify("Ворота открыты")
+                self.burst(CENTER,THEME_COLORS[self.room.theme],26,60)
+
+    def melee_attack(self):
+        player = self.player
+        self.audio.play("slash")
+        for enemy in self.enemies:
+            delta = enemy.pos - player.pos
+            if (enemy.hp <= 0 or delta.length_squared() > (MELEE_REACH + enemy.radius) ** 2
+                    or unit(delta, player.slash_direction).dot(player.slash_direction) < 0.47
+                    or any(rect.clipline(player.pos, enemy.pos) for rect in self.barriers)):
+                continue
+            enemy.receive_hit(MELEE_DAMAGE + player.power)
+            if not isinstance(enemy, Boss):
+                knockback = unit(delta, player.slash_direction) * 12
+                enemy.pos = move(enemy.pos, knockback, enemy.radius, self.barriers)
+            self.burst(enemy.pos, "#ffe3ae", 12, 72)
+            self.shake = max(self.shake, 0.10)
+
+    def update_hazards(self, enemy, dt):
+        for hazard in enemy.hazards[:]:
+            hazard.wait -= dt
+            if hazard.wait > 0:
+                continue
+            enemy.hazards.remove(hazard)
+            if hazard.end is None:
+                self.on_explosion(hazard.point, hazard.radius)
+                hits = hazard.point.distance_squared_to(self.player.pos) < hazard.radius ** 2
+            else:
+                self.beam_flashes.append((hazard, 0.19))
+                self.audio.play("explosion")
+                axis = hazard.end - hazard.point
+                fraction = (self.player.pos - hazard.point).dot(axis) / axis.length_squared()
+                foot = hazard.point.lerp(hazard.end, max(0, min(1, fraction)))
+                hits = (0 <= fraction <= 1 and foot.distance_squared_to(self.player.pos) < hazard.radius ** 2
+                        and not any(rect.clipline(foot, self.player.pos) for rect in self.barriers))
+            if hits:
+                self.hit_player(hazard.damage)
+
+    def space_out_enemies(self, dt):
+        # Keep overlapping crowds readable while preserving walls and cover.
+        for index, left in enumerate(self.enemies):
+            for right in self.enemies[index + 1:]:
+                delta = left.pos - right.pos
+                distance = delta.length()
+                separation = left.radius + right.radius + 3
+                if distance < separation:
+                    offset = unit(delta, (1, 0)) * min(45 * dt, (separation - distance) / 2)
+                    left.pos = move(left.pos, offset, left.radius, self.barriers)
+                    right.pos = move(right.pos, -offset, right.radius, self.barriers)
+
+    def update_waves(self, dt):
+        room = self.room
+        if room.enemies or not room.reinforcements:
+            return
+        if room.wave_wait is None:
+            room.wave_wait = WAVE_DELAY
+            # Old enemy shots should not hide the reinforcement warning.
+            self.bullets[:] = [bullet for bullet in self.bullets if not bullet.hostile]
+            self.audio.play("impact")
+            return
+        room.wave_wait -= dt
+        if room.wave_wait > 0:
+            return
+        room.wave = 2
+        room.wave_wait = None
+        for enemy in room.reinforcements:
+            enemy.timer = max(enemy.timer, 0.95)
+            self.burst(enemy.pos, THEME_COLORS[room.theme], 7, 36)
+        room.enemies.extend(room.reinforcements)
+        room.reinforcements.clear()
+
+    def burst(self, pos, color, count, speed):
+        for _ in range(count):
+            velocity = V2(speed * self.fx_rng.uniform(0.3, 1.0), 0).rotate(self.fx_rng.randrange(360))
+            self.particles.append(Particle(V2(pos), velocity, self.fx_rng.uniform(0.12, 0.41),
+                                           color, self.fx_rng.choice((1, 2, 3))))
+
+    def on_explosion(self, pos, radius=46):
+        self.audio.play("explosion")
+        self.shake = max(self.shake, 0.22)
+        self.blasts.append((V2(pos), 0.35, radius))
+        self.burst(pos, "#f49fb3", 35, 107)
+
+    def hit_player(self, amount):
+        if self.player.hurt(amount):
+            self.audio.play("hurt")
+            self.shake = max(self.shake, 0.16)
+            self.burst(self.player.pos, RED, 14, 65)
+
+    def on_shot(self, shots):
+        self.audio.play("shot")
+        point = shots[0].pos + self.player.aim * 15
+        self.burst(point, shots[0].color, 4, 34)
+        if shots[0].weapon == "salt":
+            player = self.player
+            player.pos = move(player.pos, -player.aim * 14, 8, self.barriers)
+
+    def on_enemy_dead(self, enemy):
+        self.kills += 1
+        self.audio.play("kill")
+        self.burst(enemy.pos, "#d1afff", 18, 90)
+        if isinstance(enemy, Boss):
+            self.on_explosion(enemy.pos)
+            return
+        kind = monster_drop(self.drops_rng.randrange(DROP_TICKETS))
+        if kind:
+            self.room.loot.append(Drop(kind, enemy.pos.copy()))
+
+    def update_bullets(self, dt):
+        active, self.bullets = self.bullets, []
+        for bullet in active:
+            bullet.age += dt
+            bullet.ttl -= dt
+            if not bullet.hostile:
+                if self.prepare_player_shot(bullet, dt):
+                    continue
+            if bullet.curve:
+                bullet.vel.rotate_ip(bullet.curve * dt)
+            start = bullet.pos
+            end = start + bullet.vel * dt
+            if bullet.hostile:
+                # The secret fight can have hundreds of hostile bullets at once.
+                self.advance_hostile(bullet, end)
+                continue
+            obstacle, normal = terrain_hit(start, end, self.barriers)
+            limit = min(obstacle, start.distance_squared_to(end) + .01)
+            hits = sorted(((segment_hit(start,end,target_rect(enemy.pos,enemy.radius)),enemy)
+                           for enemy in self.enemies if enemy.hp > 0 and enemy not in bullet.hit_targets),
+                          key=lambda pair: pair[0])
+            stopped_on_enemy = False
+            travel = unit(bullet.vel)
+            for distance, enemy in hits:
+                if distance >= limit:
+                    break
+                if enemy.hp <= 0:
+                    continue
+                point = start + travel * math.sqrt(distance)
+                self.weapon_hit(bullet, enemy, bullet.distance + math.sqrt(distance))
+                self.on_impact(bullet, point)
+                if not bullet.piercing:
+                    stopped_on_enemy = True
+                    break
+                bullet.piercing -= 1
+                bullet.hit_targets.add(enemy)
+            if stopped_on_enemy:
+                self.finish_shot(bullet, point, hit=True)
+                continue
+            if normal is not None:
+                point = start + travel * math.sqrt(obstacle)
+                self.on_impact(bullet, point)
+                if bullet.weapon == "scatter" and not bullet.bounced:
+                    bullet.bounced = True
+                    bullet.vel.reflect_ip(normal)
+                    bullet.pos = point + normal * 2
+                    bullet.damage += 4
+                    self.bullets.append(bullet)
+                    continue
+                if bullet.weapon == "saw" and not bullet.returning:
+                    bullet.pos = point + normal * 2
+                    self.return_saw(bullet)
+                    self.bullets.append(bullet)
+                    continue
+                self.finish_shot(bullet, point + normal * 3)
+                continue
+            bullet.distance += start.distance_to(end)
+            bullet.pos = end
+            if bullet.ttl > 0:
+                self.bullets.append(bullet)
+            else:
+                self.finish_shot(bullet, end)
+
+    def advance_hostile(self, bullet, end):
+        player_hit = segment_hit(bullet.pos, end, target_rect(self.player.pos, 8))
+        terrain = min((segment_hit(bullet.pos,end,rect) for rect in self.barriers),
+                      default=float("inf"))
+        if player_hit < terrain:
+            self.hit_player(bullet.damage)
+        elif terrain < float("inf"):
+            self.on_impact(bullet, bullet.pos + unit(bullet.vel) * math.sqrt(terrain))
+        elif bullet.ttl > 0 and ARENA.collidepoint(end):
+            bullet.pos = end
+            self.bullets.append(bullet)
