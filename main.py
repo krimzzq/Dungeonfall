@@ -2063,3 +2063,677 @@ class Game:
         elif bullet.ttl > 0 and ARENA.collidepoint(end):
             bullet.pos = end
             self.bullets.append(bullet)
+
+    def prepare_player_shot(self, bullet, dt):
+        """Advance weapon-specific flight before generic swept collisions."""
+        key = bullet.weapon
+        if key == "anvil":
+            if bullet.age >= self.mortar_time(bullet):
+                self.on_explosion(bullet.destination, bullet.blast)
+                self.area_damage(bullet.destination, bullet.blast, bullet.damage, over_cover=True)
+            else:
+                self.bullets.append(bullet)
+            return True
+        if key == "locust":
+            direction = unit(bullet.vel)
+            candidates = [enemy for enemy in self.enemies if enemy.hp > 0
+                          and bullet.pos.distance_squared_to(enemy.pos) < 148**2
+                          and direction.dot(unit(enemy.pos-bullet.pos)) > 0.17
+                          and self.visible(bullet.pos, enemy.pos)]
+            target = min(candidates, key=lambda enemy: bullet.pos.distance_squared_to(enemy.pos), default=None)
+            if target:
+                turn = bullet.vel.angle_to(target.pos-bullet.pos)
+                turn = (turn + 180) % 360 - 180
+                bullet.vel.rotate_ip(max(-280*dt, min(280*dt, turn)))
+        elif key == "fork" and bullet.age >= .17:
+            for angle in (-26,0,26):
+                self.bullets.append(Bullet(bullet.pos.copy(),bullet.vel.rotate(angle),
+                                           bullet.damage,bullet.color,ttl=.48,weapon="fork_shard"))
+            self.burst(bullet.pos,bullet.color,7,53)
+            return True
+        elif key == "comet":
+            speed = min(850, bullet.vel.length() + 1180 * dt)
+            bullet.vel.scale_to_length(speed)
+        elif key == "saw":
+            if not bullet.returning and bullet.age >= .39:
+                self.return_saw(bullet)
+            if bullet.returning:
+                delta = self.player.pos - bullet.pos
+                if delta.length() < 15:
+                    return True
+                bullet.vel = unit(delta) * 440
+        return False
+
+    @staticmethod
+    def mortar_time(bullet):
+        return .34 + min(.66, bullet.pos.distance_to(bullet.destination) / 640)
+
+    @staticmethod
+    def return_saw(bullet):
+        bullet.returning = True
+        bullet.hit_targets.clear()
+        bullet.piercing = WEAPONS["saw"].piercing
+
+    def visible(self, start, end):
+        return not any(rect.clipline(start, end) for rect in self.barriers)
+
+    def weapon_hit(self, bullet, enemy, distance):
+        key = bullet.weapon
+        damage = bullet.damage
+        player = self.player
+        if key == "pistol" and player.selected == key:
+            player.focus_hits = min(5, player.focus_hits + 1) if player.focus_target is enemy else 1
+            player.focus_target = enemy
+            damage += 4 * (player.focus_hits - 1)
+            if player.focus_hits == 5:
+                self.burst(enemy.pos, GOLD, 5, 51)
+        elif key == "comet":
+            damage += min(57, int(distance * .20))
+        elif key == "salt":
+            damage = max(3, int(damage * max(.25, 1.8 - distance / 59)))
+        enemy.receive_shot(bullet, damage)
+
+        if key == "coil":
+            self.chain_lightning(enemy, damage, bullet.color)
+        elif key == "frost":
+            enemy.frost_marks += 1
+            enemy.frost_window = 1.55
+            if enemy.frost_marks >= 3:
+                enemy.frost_marks = 0
+                enemy.frozen = .34 if isinstance(enemy,Boss) else .92
+                self.burst(enemy.pos, "#b5eaf1", 12, 62)
+        elif key == "ember":
+            enemy.ember_marks += 1
+            enemy.ember_window = 1.5
+            if enemy.ember_marks >= 3:
+                enemy.ember_marks = 0
+                self.on_explosion(enemy.pos,26)
+                self.area_damage(enemy.pos,26,45 + self.player.power)
+
+    def chain_lightning(self, enemy, damage, color):
+        visited = {enemy}
+        for strength in (.75,.53,.38):
+            candidates = (other for other in self.enemies if other.hp > 0 and other not in visited
+                          and enemy.pos.distance_squared_to(other.pos) < 108**2
+                          and self.visible(enemy.pos,other.pos))
+            target = min(candidates, key=lambda other: enemy.pos.distance_squared_to(other.pos), default=None)
+            if target is None:
+                break
+            target.receive_hit(round(damage * strength))
+            self.arcs.append((enemy.pos.copy(), target.pos.copy(),color,.15))
+            visited.add(target)
+            enemy = target
+
+    def finish_shot(self, bullet, point, hit=False):
+        if bullet.weapon == "pistol" and self.player.selected == "pistol" and not hit:
+            self.player.focus_hits = 0
+            self.player.focus_target = None
+        if bullet.weapon == "nova":
+            self.fields.append(WeaponField("nova",point,32,1.85,18+self.player.power))
+            self.burst(point, "#ffb97f", 14, 62)
+        elif bullet.weapon == "eclipse":
+            self.fields.append(WeaponField("eclipse",point,73,.85,63+self.player.power))
+            self.burst(point, "#c9a8ec", 14, 69)
+        elif bullet.blast:
+            self.on_explosion(point, bullet.blast)
+            self.area_damage(point, bullet.blast, bullet.damage)
+
+    def area_damage(self, point, radius, damage, over_cover=False):
+        for enemy in self.enemies:
+            if (enemy.hp > 0 and enemy.pos.distance_squared_to(point) < (radius+enemy.radius*.5)**2
+                    and (over_cover or self.visible(point, enemy.pos))):
+                enemy.receive_hit(damage)
+
+    def update_fields(self, dt):
+        for field in self.fields[:]:
+            field.ttl -= dt
+            field.next_tick -= dt
+            if field.kind == "nova" and field.next_tick <= 0 and field.ttl > 0:
+                self.area_damage(field.pos, field.radius, field.damage)
+                field.next_tick += .30
+            elif field.kind == "eclipse":
+                for enemy in self.enemies:
+                    distance = enemy.pos.distance_to(field.pos)
+                    if (enemy.hp > 0 and not isinstance(enemy,Boss) and 5 < distance < field.radius
+                            and self.visible(field.pos,enemy.pos)):
+                        delta = unit(field.pos-enemy.pos) * min(distance,dt*145)
+                        enemy.pos = move(enemy.pos,delta,enemy.radius,self.barriers)
+            if field.ttl <= 0:
+                if field.kind == "eclipse":
+                    self.on_explosion(field.pos,37)
+                    self.area_damage(field.pos,37,field.damage)
+                self.fields.remove(field)
+
+    def on_impact(self, bullet, pos):
+        if not bullet.hostile:
+            self.audio.play("impact")
+        self.burst(pos, bullet.color, 4, 49)
+
+    @staticmethod
+    def light_stamp(color, radius):
+        size=2*radius+2
+        tile=pg.Surface((size,size))
+        for step in range(5,0,-1):
+            d=step*radius//5
+            c=tuple(value*(6-step)//29 for value in color)
+            corners=((radius-d,radius-d//2),(radius-d//2,radius-d),(radius+d//2,radius-d),
+                     (radius+d,radius-d//2),(radius+d,radius+d//2),(radius+d//2,radius+d),
+                     (radius-d//2,radius+d),(radius-d,radius+d//2))
+            pg.draw.polygon(tile,c,corners)
+        return tile
+
+    def gate_sprite(self, direction, point, frame):
+        assets=self.themes[self.room.theme]
+        side=direction[0]!=0
+        sprite=assets["side" if side else "gate"][frame]
+        if direction[0]==-1:
+            sprite=pg.transform.flip(sprite,True,False)
+        x,y=point
+        if side:
+            return sprite, (x-sprite.get_width()//2,y-sprite.get_height()//2)
+        offset = 31 if direction[1] < 0 else 28
+        return sprite,(x-sprite.get_width()//2,y-offset)
+
+    def render_zone(self, point, radius, active=True):
+        x,y = int(point.x),int(point.y)
+        color="#f79571" if active else "#a85663"
+        rect=pg.Rect(x-radius,y-radius,radius*2,radius*2)
+        base=pg.Surface(rect.size,pg.SRCALPHA)
+        for row in range(4,rect.h,6):
+            for col in range(4+(row//6)%2*3,rect.w,6):
+                if (row-radius)**2+(col-radius)**2 < radius**2:
+                    pg.draw.rect(base,(196,77,86,112),(col,row,3,2))
+        self.target.blit(base,rect)
+        # Pixel corner brackets mark the radius while the attacker uses only a red “!”.
+        for dx in (-1,1):
+            for dy in (-1,1):
+                corner=(x+dx*(radius-4),y+dy*(radius-4))
+                self.line(color,corner,(corner[0]-dx*9,corner[1]),2)
+                self.line(color,corner,(corner[0],corner[1]-dy*9),2)
+
+    def draw_wave_spawns(self):
+        if self.room.wave_wait is None:
+            return
+        phase = int(self.room.wave_wait * 12) % 2
+        color = "#eea17c" if phase else "#cf796e"
+        for enemy in self.room.reinforcements:
+            x, y = enemy.pos
+            for dx, dy in ((-1,-1), (-1,1), (1,-1), (1,1)):
+                corner = x + 12 * dx, y + 9 * dy
+                self.line(color, corner, (corner[0] - 5 * dx, corner[1]), 2)
+                self.line(color, corner, (corner[0], corner[1] - 4 * dy), 2)
+
+    def draw_arena(self):
+        self.screen.blit(self.backdrop,(0,0))
+        theme=self.room.theme
+        accent="#ed9279" if self.room.kind == "secret" else THEME_COLORS[theme]
+        layers=self.cover_layers.copy()
+        frame=0 if not self.room.cleared else (2 if self.gate_open >= 0.20 else 1)
+        for direction,(point,_,_) in self.doors.items():
+            sprite, pos = self.gate_sprite(direction,point,frame)
+            if direction[1] > 0:
+                layers.append((point[1]+4,sprite,V2(pos)))
+            else:
+                self.put_sprite(sprite,pos)
+
+        flame_t=int(self.t*9)
+        for index, (x,y) in enumerate(((52,88),(574,88),(52,279),(574,279))):
+            shape=self.flames[(flame_t+index)%4]
+            lamp=self.lantern_light[(2 if theme==2 else 0)+(flame_t+index)//2%2]
+            self.screen.blit(lamp,lamp.get_rect(center=(x,y-4)),special_flags=pg.BLEND_RGB_ADD)
+            self.put_sprite(shape,(x-8,y-12))
+        for phase,x,y in self.motes:
+            tick=int((self.t*6+phase)%15)
+            if tick<10:
+                drift=-tick//2 if theme==1 else tick//2
+                self.rect(accent if tick in (4,5) else ("#71855e","#9e6650","#92a7ad")[theme],
+                          (x+(tick//3)%3, y+drift, 1+(tick in (4,5)),1))
+
+        if self.progress_gate():
+            asset= self.themes[theme]["gate"][2]
+            self.put_sprite(asset,CENTER-(28,30))
+            for side in (-1,1):
+                self.rect(accent,(CENTER.x+side*19-2,CENTER.y-5,3,5))
+        if self.room.chest:
+            chest_frame = 0 if not self.room.opened else (1 if self.t-self.room.opened_at < 0.13 else 2)
+            chest=self.chests[chest_frame]
+            layers.append((CHEST_RECT.bottom,chest,CENTER-(17,20)))
+
+        for pos,ttl,radius in self.blasts:
+            if ttl>0.22:
+                width=max(2,round(radius*(1-ttl/0.35)))
+                x,y=pos
+                for dx,dy in ((0,-1),(0,1),(-1,0),(1,0),(-1,-1),(1,1),(1,-1),(-1,1)):
+                    bias=width if dx==0 or dy==0 else width*0.67
+                    self.rect("#f6c08f",(x+dx*bias-2,y+dy*bias-2,4,4))
+            elif ttl>0:
+                self.rect("#645260",(pos.x-3,pos.y-2,7,4))
+
+        for drop in self.room.loot:
+            icon=self.items.get(drop.kind) or self.weapons_art[drop.kind]
+            pos=drop.position(self.t)
+            self.rect("#292933",(drop.pos.x-6,drop.pos.y+5,12,3))
+            if drop.ready(self.t):
+                self.rect(GOLD if drop.kind in WEAPONS else accent,(pos.x-1,pos.y-11,2,2))
+            size=(24,14) if drop.kind in WEAPONS else (12,12)
+            self.put_sprite(icon,pos-V2(size)/2,size)
+
+        self.draw_wave_spawns()
+        self.draw_weapon_fields()
+        markers=[]
+        for enemy in self.enemies:
+            if enemy.warning is not None:
+                self.render_zone(enemy.warning,enemy.blast_radius,int(self.t*9)%2==0)
+            for hazard in enemy.hazards:
+                active = hazard.wait < 0.36 or int(self.t * 9) % 2 == 0
+                if hazard.end is None:
+                    self.render_zone(hazard.point, hazard.radius, active)
+                else:
+                    self.draw_beam(hazard, active)
+            kind="demon" if isinstance(enemy,Demon) else f"{enemy.kind}-{theme}"
+            sprite=self.actor_frame(enemy,kind,enemy.flash>0,enemy.attacking or enemy.burst>0)
+            self.queue_actor(layers,enemy.pos,sprite)
+            if enemy.attacking:
+                height=84 if isinstance(enemy,Demon) else 53 if isinstance(enemy,Boss) else 34
+                y=max(43,enemy.pos.y-height)
+                markers.append((enemy.pos.x-4,y))
+            if enemy.frozen or enemy.frost_marks:
+                self.rect("#afe7ef",(enemy.pos.x-6,enemy.pos.y+7,12 if enemy.frozen else enemy.frost_marks*4,2))
+            if enemy.ember_marks:
+                self.rect("#ff9a67",(enemy.pos.x-4,enemy.pos.y+11,enemy.ember_marks*4,2))
+        p=self.player
+        self.queue_actor(layers,p.pos,self.actor_frame(p,p.hero,p.hurt_flash>0,p.flash>0 or p.melee_flash>0))
+        for _,sprite,pos in sorted(layers,key=lambda layer:layer[0]):
+            self.put_sprite(sprite,pos)
+
+        for enemy in self.enemies:
+            if isinstance(enemy,Demon) and enemy.exposed > 0:
+                x,y=enemy.pos-(0,25)
+                outline = "#f3ba87" if int(self.t*12)%2 else "#e68768"
+                pg.draw.polygon(self.target,outline,((x,y-9),(x+8,y),(x,y+9),(x-8,y)),2)
+                self.rect("#ffe7b3",(x-2,y-3,5,6))
+            elif not isinstance(enemy,Boss) and not enemy.attacking:
+                x,y=enemy.pos
+                self.bar((x-9,y-23,18,2),enemy.hp/enemy.max_hp,"#ea786e")
+        for mark in markers:
+            self.put_sprite(self.warning_icon,mark)
+        for hazard, _ in self.beam_flashes:
+            self.draw_beam(hazard, True, fired=True)
+        for start,end,color,_ in self.arcs:
+            mid = start.lerp(end,.50) + unit(end-start).rotate(90)*6
+            pg.draw.lines(self.target, color, False, (start,mid,end),3)
+            pg.draw.lines(self.target, "#fcf2ed", False, (start,mid,end))
+
+        aim=round(p.aim.angle_to(V2(1,0))/15)*15
+        gun=self.gun_angles[p.selected][aim%360]
+        self.screen.blit(gun,gun.get_rect(center=p.pos+p.aim*15))
+        if p.flash>0:
+            tip=p.pos+p.aim*27
+            x,y=tip
+            self.rect("#ffce88",(x-2,y-2,5,5))
+            self.rect("#fff4bd",(x-1,y-1,3,3))
+            self.rect("#f5a468",(x+p.aim.x*5,y+p.aim.y*5,2,2))
+        if p.melee_flash > 0:
+            self.draw_slash(p)
+        if p.charge > 0:
+            spot = p.pos + p.aim*25
+            size = 2 + int(p.charge / RAPIER_CHARGE * 7)
+            self.rect("#eff3e4",(spot.x-size//2,spot.y-size//2,size,size),1)
+
+        for bullet in self.bullets:
+            self.draw_bullet(bullet)
+
+        for spark in self.particles:
+            size=max(1,spark.size if spark.ttl>0.10 else spark.size-1)
+            self.rect(spark.color,(*spark.pos,size,size))
+        self.draw_hud()
+        if self.state=="play":
+            self.draw_cursor()
+
+    def actor_frame(self,actor,kind,hurt,attack):
+        row=3 if hurt else 2 if attack else 1 if actor.moving else 0
+        rate=(5,13,17,20)[row]
+        return self.frames[kind][actor.left][row][int(self.t*rate)%6]
+
+    def draw_weapon_fields(self):
+        for field in self.fields:
+            x,y=field.pos
+            if field.kind == "nova":
+                bounds=(x-field.radius,y-field.radius/2,field.radius*2,field.radius)
+                pg.draw.ellipse(self.target, "#5e313c", bounds)
+                pg.draw.ellipse(self.target, "#ed9260", bounds, 2)
+                for index in range(11):
+                    angle = index*137.51 + int(self.t*10)*8
+                    spot = field.pos + V2(4+index*2.4,0).rotate(angle)
+                    self.rect("#eaa56c",(spot.x,spot.y,2,2+(index%3)))
+            else:
+                for index in range(3):
+                    angle = self.t*250+index*120
+                    points = [field.pos + V2(10+step*4,0).rotate(angle-step*15) for step in range(8)]
+                    pg.draw.lines(self.target,"#ad72c1",False,points,2)
+                pg.draw.circle(self.target, "#312038", field.pos, 8)
+
+    def draw_bullet(self, bullet):
+        pos = bullet.pos
+        if bullet.weapon == "anvil":
+            fraction = min(1, bullet.age/self.mortar_time(bullet))
+            ground = pos.lerp(bullet.destination, fraction)
+            pos = ground - (0,math.sin(math.pi*fraction)*64)
+            pg.draw.circle(self.target,bullet.color,bullet.destination,bullet.blast,1)
+            self.rect("#3c3038",(ground.x-4,ground.y-1,8,3))
+            self.rect(bullet.color,(pos.x-4,pos.y-3,8,6))
+            self.rect("#ffedba",(pos.x-2,pos.y-2,3,3))
+            return
+        x,y=pos
+        if bullet.weapon == "saw":
+            pg.draw.circle(self.target, "#303642",pos,6)
+            pg.draw.circle(self.target,bullet.color,pos,5,2)
+            angle = bullet.age*1600
+            for index in range(3):
+                tooth = pos+V2(4,0).rotate(angle+120*index)
+                self.rect(bullet.color,(*tooth,3,3))
+            return
+        tail=pos-bullet.vel*(0.033 if bullet.piercing or bullet.weapon=="comet" else 0.019)
+        self.line("#3a303d",pos,tail,3)
+        self.line(bullet.color,pos,tail,2)
+        self.rect(bullet.color,(x-2,y-2,5 if bullet.hostile else 4,4))
+        self.rect("#f7e7bc",(x-1,y-1,2,2))
+
+    def draw_slash(self, player):
+        progress = 1 - player.melee_flash / MELEE_FLASH
+        sweep = -61 + 88 * progress
+        for radius, color, thickness in ((39,"#c77c65",4),(42,"#f6c185",4),(45,"#fff3c9",2)):
+            points = [player.pos + player.slash_direction.rotate(sweep + offset) * radius
+                      for offset in range(0,37,6)]
+            pg.draw.lines(self.target, color, False, points, thickness)
+
+    def draw_beam(self, hazard, active, fired=False):
+        axis = hazard.end - hazard.point
+        if fired:
+            self.line("#b95058", hazard.point, hazard.end, hazard.radius * 2)
+            self.line("#ff9f88", hazard.point, hazard.end, hazard.radius)
+            self.line("#fff0c0", hazard.point, hazard.end, 3)
+        else:
+            normal = axis.normalize().rotate(90) * hazard.radius
+            color = "#df786d" if active else "#9c5660"
+            for offset in (-normal, normal):
+                self.line(color, hazard.point + offset, hazard.end + offset)
+            self.line("#ad5d63", hazard.point, hazard.end)
+
+    def queue_actor(self,queue,pos,frame):
+        side=frame.get_width()
+        shadow=pg.Rect(0,0,int(side*0.67),int(side*0.16))
+        shadow.center=pos+(0,4)
+        self.rect("#262832",shadow)
+        self.rect("#20232c",(shadow.x+2,shadow.y+1,shadow.w-4,max(1,shadow.h-2)))
+        queue.append((pos.y,frame,pos-(side/2,side*0.78)))
+
+    def bar(self,bounds,fraction,color):
+        x,y,w,h=bounds
+        self.rect("#1c1b25",(x-1,y-1,w+2,h+2))
+        self.rect("#42404a",bounds)
+        filled=int(w*max(0,min(1,fraction)))
+        if filled:
+            self.rect(color,(x,y,filled,h))
+
+    def draw_map(self):
+        xs,ys=zip(*self.rooms)
+        min_x,min_y=min(xs),min(ys)
+        step=min(10,32//(max(ys)-min_y+1))
+        map_width=(max(xs)-min_x+1)*step
+        map_height=(max(ys)-min_y+1)*step
+        self.panel((547,3,73,37),"#211f2a","#514957")
+        start=V2(583-map_width//2,21-map_height//2)
+        positions={key:start+((key[0]-min_x)*step,(key[1]-min_y)*step)
+                   for key in self.rooms}
+        for coord,room in self.rooms.items():
+            for dx,dy in room.links:
+                point=positions[coord]+(step/2,step/2)
+                neighbor=self.rooms[(coord[0]+dx,coord[1]+dy)]
+                color=THEME_COLORS[room.theme] if room.visited and neighbor.visited else "#565461"
+                self.line(color,point,point+(dx*step/2,dy*step/2))
+        for coord,room in self.rooms.items():
+            x,y=positions[coord]
+            color=THEME_COLORS[room.theme] if room.visited else "#767482"
+            self.rect(color,(x+1,y+1,step-2,step-2))
+        px,py=positions[self.coord]+(step//2,step//2)
+        self.rect("#461e2e",(px-2,py-2,5,5))
+        self.rect("#ff495b",(px-1,py-1,3,3))
+
+    def draw_hud(self):
+        self.rect(INK,(0,0,WIDTH,43))
+        self.rect(INK,(0,336,WIDTH,24))
+        self.line("#6d5b61",(19,42),(621,42))
+        self.line("#6d5b61",(19,336),(621,336))
+        p=self.player
+        self.put_sprite(self.items["vital"],(21,13),(15,15))
+        self.label(f"{p.hp}/{p.max_hp}",42,10,2)
+        self.bar((42,30,97,4),p.hp/p.max_hp,"#e98476")
+        location=self.room.theme
+        if self.room.kind == "secret":
+            self.label("РАЗЛОМ",176,8,2,"#f0a77f")
+            self.label("СЕКРЕТНАЯ АРЕНА",178,27,1,MUTED)
+        else:
+            self.label(f"{('I','II','III')[location]}   {LEVELS[location]}",176,8,2,THEME_COLORS[location])
+            self.label(f"ЭТАЖ {floor_of(self.level)}/5   /   {ROOM_LABELS[self.room.kind]}",178,27,1,MUTED)
+        if self.room.kind in ("combat", "vault") and self.enemies:
+            self.label(f"ВОЛНА {self.room.wave}  ВРАГИ {len(self.enemies)}",426,28,1,GOLD)
+        self.draw_map()
+
+        for index,clip in enumerate(p.slots):
+            x=19+index*137
+            current=index==p.active
+            self.panel((x,341,128,15), "#39343d" if current else "#262431",
+                       GOLD if current else "#5f525d")
+            self.label(str(index+1),x+5,345,1,GOLD if current else MUTED)
+            if clip:
+                self.put_sprite(self.weapons_art[clip.name],(x+15,344),(19,10))
+                self.label(WEAPONS[clip.name].name,x+37,345,1)
+                ammo=str(clip.rounds) if clip.reserve is None else f"{clip.rounds}/{clip.reserve}"
+                if current and p.reload:
+                    ammo=f"{p.reload:0.1f}С"
+                self.label(ammo,x+123,345,1,GOLD if current else MUTED,"right")
+            else:
+                self.label("Пусто",x+37,345,1,MUTED)
+        self.label(f"ПОВЕРЖЕНО {self.kills}",619,345,1,MUTED,"right")
+        blade = GOLD if p.melee_timer == 0 else MUTED
+        pg.draw.polygon(self.target, blade, ((297,350),(304,343),(305,343),(305,345),(299,352)))
+        self.line(blade,(296,349),(300,353))
+        self.rect(blade,(295,353,2,2))
+        self.bar((310,347,24,3),1-p.melee_timer/MELEE_INTERVAL,GOLD)
+        meter = {"pistol":p.focus_hits/5, "pulse":p.spin, "rapier":p.charge/RAPIER_CHARGE}.get(p.selected)
+        if meter is not None:
+            self.bar((346,347,22,3),meter,p.weapon.color)
+
+        boss=next((e for e in self.enemies if isinstance(e,Boss)),None)
+        if isinstance(boss,Demon):
+            self.panel((139,69,362,27),"#302239","#a56a70")
+            self.label(boss.name,150,74,1,"#fbd2a4")
+            self.label(f"{max(0,boss.hp)}/{boss.max_hp}",490,74,1,"#fbd2a4","right")
+            self.label("ЯДРО ОТКРЫТО" if boss.exposed else f"ФАЗА {boss.phase}/3",
+                       320,74,1,GOLD if boss.exposed else MUTED,"center")
+            self.bar((150,87,340,4),boss.hp/boss.max_hp,GOLD if boss.exposed else "#ef776f")
+        elif boss:
+            self.panel((200,74,240,23),edge="#9b676e")
+            self.label(boss.name,320,78,1,"#f8c69c","center")
+            self.bar((211,90,218,3),boss.hp/boss.max_hp,
+                     "#e8786d" if boss.enraged else "#cb8c75")
+
+        if self.state=="play":
+            if self.room.wave_wait is not None:
+                self.panel((220,80,200,24),"#3b2b3d","#c7856c")
+                self.label("ВТОРАЯ ВОЛНА",320,85,2,"#ffd79b","center")
+            hint=self.nearby()[2]
+            if hint:
+                x=max(106,min(WIDTH-106,p.pos.x))
+                y=p.pos.y-47 if p.pos.y>117 else p.pos.y+24
+                self.panel((x-100,y,200,15),edge="#8e786b")
+                self.label(hint,x,y+4,1,GOLD,"center")
+            elif self.t<self.message_until:
+                self.label(self.message,405,345,1,THEME_COLORS[location],"center")
+            elif self.room.kind=="entry" and self.t-self.room_arrived<1.15:
+                self.panel((212,106,216,31))
+                self.label(LEVELS[location],320,112,1,THEME_COLORS[location],"center")
+                self.label(f"Этаж {floor_of(self.level)}/5",320,125,1,PAPER,"center")
+
+    def draw_cursor(self):
+        x,y=self.mouse()
+        if ARENA.collidepoint(x,y):
+            for a,b in (((x-7,y),(x-3,y)),((x+3,y),(x+7,y)),
+                        ((x,y-7),(x,y-3)),((x,y+3),(x,y+7))):
+                self.line("#e8d6a9",a,b)
+            self.rect("#453343",(x,y,1,1))
+
+    def overlay(self):
+        self.screen.blit(self.scrim,(0,0))
+
+    def draw_menu(self):
+        self.screen.blit(self.cover,(0,0))
+        self.label("DUNGEONFALL",28,82,3,"#8d5452")
+        self.label("DUNGEONFALL",28,79,3,"#f4d8a7")
+        self.label("ПОДЗЕМЕЛЬЕ ТРЁХ ПЕЧАТЕЙ",30,112,1,"#c5a581")
+        y=146
+        self.button("Новая игра",27,y,self.show_controls,190)
+        y+=34
+        if self.profile.checkpoint is not None:
+            level=self.profile.checkpoint["level"]
+            self.button(f"Продолжить {region_of(level)+1}-{floor_of(level)}",
+                        27,y,self.continue_run,190)
+            y+=34
+        self.button("Настройки",27,y,self.settings,190)
+        self.button("Выход",27,y+34,self.quit,190)
+        self.label(f"ЭТАЖ {self.profile.best}/{TOTAL_FLOORS}   ПОБЕДЫ {self.profile.wins}",30,322,1,"#b5a396")
+
+    def draw_controls(self):
+        self.panel((32,35,576,290),"#302a37","#917672")
+        self.label("ПЕРЕД СПУСКОМ",57,55,2,GOLD)
+        self.label("УПРАВЛЕНИЕ",58,87,1,MUTED)
+        controls=(("WASD / СТРЕЛКИ","Движение"),("МЫШЬ / ЛКМ","Прицел и огонь"),
+                  ("ПКМ","Удар вблизи"),("R","Перезарядка"),("1 / 2","Слоты оружия"),
+                  ("E","Ворота / взять"),("ESC / F11","Пауза / экран"))
+        for i,(key,meaning) in enumerate(controls):
+            y=111+i*21
+            self.label(key,60,y,1,"#e5b883")
+            self.label(meaning,151,y,1,PAPER)
+        self.label("ГЕРОЙ",344,87,1,MUTED)
+        for index,(key,(name,hp,speed)) in enumerate(HEROES.items()):
+            y=109+index*74
+            selected=key==self.chosen_hero
+            bounds=(344,y,235,64)
+            self.panel(bounds,"#464050" if selected else "#30303d",
+                       GOLD if selected else "#79676c")
+            self.buttons.append((pg.Rect(bounds),lambda k=key:self.choose_hero(k)))
+            sprite=self.frames[key][0][0][int(self.t*5)%6]
+            self.put_sprite(sprite,(351,y+11),(41,41))
+            self.label(f"{index+1}  {name}",401,y+10,1,GOLD if selected else PAPER)
+            self.label(f"{hp} ЗДОРОВЬЯ",402,y+27,1,PAPER)
+            self.label("БЫСТРЕЕ" if speed>150 else "БОЛЬШЕ ЗДОРОВЬЯ",402,y+44,1,MUTED)
+        self.button("Начать спуск",57,274,self.start,181)
+        self.button("Назад",251,274,self.escape,114)
+
+    def draw_settings(self):
+        self.panel((121,36,398,284),"#302a37","#917672")
+        self.label("НАСТРОЙКИ",147,53,2,GOLD)
+        options=self.profile.options
+        for index,(name,key) in enumerate((("Музыка","music"),("Звуки","effects"))):
+            y=94+32*index
+            self.label(name,148,y+10,1)
+            self.button("-",332,y,lambda k=key:self.option(k,-1),34)
+            self.label(f"{options[key]}%",393,y+10,1,GOLD,"center")
+            self.button("+",421,y,lambda k=key:self.option(k,1),34)
+        descriptions=(
+            ("Масштаб окна",f"{options['scale']}X","scale"),
+            ("Полный экран (F11)","Вкл." if options["fullscreen"] else "Выкл.","fullscreen"),
+            ("Встряска при уроне","Вкл." if options["shake"] else "Выкл.","shake"),
+        )
+        for i,(name,value,key) in enumerate(descriptions):
+            y=158+32*i
+            self.label(name,148,y+10,1)
+            self.button(value,332,y,lambda k=key:self.option(k),123)
+        self.button("Назад",148,263,self.escape,122)
+        if not self.audio.ready:
+            self.label("Аудиоустройство недоступно",149,304,1,MUTED)
+
+    def draw_swap(self):
+        drop=self.pending_weapon
+        weapon=WEAPONS[drop.kind]
+        self.panel((111,54,418,244),"#302a37","#917672")
+        self.label(weapon.name,320,72,2,GOLD,"center")
+        self.label(weapon.note,320,102,1,PAPER,"center")
+        self.put_sprite(self.weapons_art[drop.kind],(291,111),(58,33))
+        self.label("ВЫБЕРИ СЛОТ",320,151,1,MUTED,"center")
+        for index in range(2):
+            clip=self.player.slots[index]
+            text=WEAPONS[clip.name].name if clip else "Пусто"
+            x=130+index*195
+            self.button(f"{index+1} {text}",x,166,lambda i=index:self.equip_pending(i),179)
+            note="ОРУЖИЕ УПАДЁТ НА ПОЛ" if clip else "СВОБОДНЫЙ СЛОТ"
+            self.label(note,x,203,1,MUTED)
+        self.button("Оставить",245,246,self.escape,150)
+
+    def draw_end(self):
+        won=self.state=="win"
+        self.overlay()
+        self.panel((189,81,262,207),"#302a37","#917672")
+        demon = self.room.kind == "secret"
+        title = ("ДЕМОН ПОВЕРЖЕН" if demon else "РАЗЛОМ ЗАКРЫТ") if won else "ПОРАЖЕНИЕ"
+        self.label(title,
+                   320,101,2,GOLD if won else RED,"center")
+        result = f"ЭТАЖ {self.level}/{TOTAL_FLOORS}  ПОВЕРЖЕНО {self.kills}"
+        if demon:
+            result = "ПОБЕДА НА СЕКРЕТНОЙ АРЕНЕ" if won else "ДЕМОН РАЗЛОМА"
+        self.label(result,320,139,1,PAPER,"center")
+        self.button("Новая попытка",211,174,self.show_controls,218)
+        self.button("Главное меню",211,211,lambda:self.change_state("menu"),218)
+
+    def draw(self):
+        self.buttons.clear()
+        if self.state=="menu":
+            self.draw_menu()
+        elif self.state in ("settings","controls"):
+            if self.state=="settings" and self.settings_from=="pause":
+                self.draw_arena()
+            else:
+                self.screen.blit(self.cover,(0,0))
+            self.overlay()
+            if self.state=="settings":
+                self.draw_settings()
+            else:
+                self.draw_controls()
+        else:
+            self.draw_arena()
+            if self.state=="pause":
+                self.overlay()
+                self.panel((207,80,226,195),"#302a37","#917672")
+                self.label("ПАУЗА",320,100,2,GOLD,"center")
+                self.button("Продолжить",222,135,lambda:self.change_state("play"))
+                self.button("Настройки",222,173,self.settings)
+                self.button("Главное меню",222,211,lambda:self.change_state("menu"))
+            elif self.state=="swap":
+                self.overlay()
+                self.draw_swap()
+            elif self.state in ("dead","win"):
+                self.draw_end()
+        if self.profile.error:
+            self.panel((359,338,268,18))
+            self.label("ПРОВЕРЬ ФАЙЛ СОХРАНЕНИЯ",368,343,1,RED)
+        rect=self.viewport()
+        if self.state=="play" and self.shake>0 and self.profile.options["shake"]:
+            rect.move_ip(self.fx_rng.choice((-3,0,3)),self.fx_rng.choice((-3,0,3)))
+        self.window.fill("#14131c")
+        frame=self.screen if rect.size==(WIDTH,HEIGHT) else pg.transform.scale(self.screen,rect.size)
+        self.window.blit(frame,rect)
+        pg.display.flip()
+
+    def run(self):
+        while self.running:
+            dt = min(self.clock.tick(60) / 1000, 0.05)
+            self.t += dt
+            self.events()
+            self.update(dt)
+            self.draw()
+        pg.quit()
+
+
+if __name__ == "__main__":
+    Game().run()
