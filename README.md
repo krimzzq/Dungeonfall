@@ -86,7 +86,6 @@ python3 -m venv .venv
 - `main.py` — вся игровая логика.
 - `assets/` — спрайты, анимации, окружение, интерфейс, звуки и музыка.
 - `config/defaults.json` — настройки по умолчанию.
-- `docs/screenshots/` — кадры из игры.
 
 [Удар клинком и мини-карта](docs/screenshots/final-combat.png) · [Атака Ледяной королевы](docs/screenshots/final-boss.png) · [Управление](docs/screenshots/final-controls.png)
 
